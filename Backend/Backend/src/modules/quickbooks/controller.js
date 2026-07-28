@@ -28,7 +28,9 @@ class QuickbooksController {
         try {
             const { QuickBooksToken } = require('../../core/database');
             const mail = req.query.mail || req.session?.user_mail || req.session?.admin?.email || req.session?.googleUser?.email || null;
-            const whereClause = mail ? { mail } : {};
+            const { Op } = require('sequelize');
+            const whereClause = { status: { [Op.ne]: 'Disconnected' } };
+            if (mail) whereClause.mail = mail;
             const qbCount = await QuickBooksToken.count({ where: whereClause });
             const tier = (req.query.tier || 'pro').toLowerCase();
 

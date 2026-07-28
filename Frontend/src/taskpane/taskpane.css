@@ -2047,6 +2047,8 @@ input:checked + .toggle-slider::before {
   z-index: 1000;
   display: flex;
   flex-direction: column;
+  max-height: calc(100vh - 65px);
+  overflow-y: auto;
 }
 .dropdown-user-header {
   display: flex;
@@ -2072,6 +2074,8 @@ input:checked + .toggle-slider::before {
 }
 .dropdown-menu-list {
   padding: 8px 0;
+  max-height: calc(100vh - 65px);
+  overflow-y: auto;
 }
 .dropdown-menu-item {
   display: flex;

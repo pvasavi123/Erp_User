@@ -83,7 +83,9 @@ router.get('/connections/stats', async (req, res) => {
         if (plan === 'basic')    maxPerPlatform = 1;
         else if (plan === 'standard') maxPerPlatform = 3;
 
-        const whereClause = mail ? { mail } : {};
+        const { Op } = require('sequelize');
+        const whereClause = { status: { [Op.ne]: 'Disconnected' } };
+        if (mail) whereClause.mail = mail;
 
         const qbCount   = await QuickBooksToken.count({ where: whereClause });
         const xeroCount = await XeroToken.count({       where: whereClause });
