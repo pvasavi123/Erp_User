@@ -8,8 +8,9 @@ const subscriptionRoutes = require('../modules/subscription/subscription.routes'
 const paymentsRoutes     = require('../modules/payments/payments.routes');
 const quickbooksRoutes   = require('../modules/quickbooks/routes');
 const xeroRoutes         = require('../modules/xero/routes');
-const adminRoutes        = require('../modules/admin/routes');   // legacy — kept for backward compat
-const googleRoutes       = require('../modules/google/routes');  // legacy — kept for backward compat
+const adminRoutes        = require('../modules/admin/routes');     // legacy — kept for backward compat
+const googleRoutes       = require('../modules/google/routes');    // legacy — kept for backward compat
+const microsoftRoutes    = require('../modules/microsoft/routes'); // legacy alias — matches registered Entra redirect URI
 
 const { QuickBooksToken, XeroToken } = require('../core/database');
 const QuickBooksService = require('../modules/quickbooks/service');
@@ -392,7 +393,8 @@ router.post('/pull-master-data', async (req, res) => {
 });
 
 // ── Legacy aliases (will be removed once all clients use /api/auth) ──
-router.use('/admin',  adminRoutes);
-router.use('/google', googleRoutes);
+router.use('/admin',     adminRoutes);
+router.use('/google',    googleRoutes);
+router.use('/microsoft', microsoftRoutes);
 
 module.exports = router;

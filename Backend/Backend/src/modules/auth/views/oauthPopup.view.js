@@ -1,113 +1,77 @@
 'use strict';
 
-const AuthService    = require('./auth.service');
-const AuthValidation = require('./auth.validation');
-const UserRepository = require('./user.repository');
-const OAuthPopupView = require('./views/oauthPopup.view');
-const logger         = require('../../core/logger');
-
 /**
- * AuthController
+ * OAuthPopupView
  * ----------------------------------------------------------------
- * Thin HTTP layer — validate input, call AuthService, shape response.
- * No business logic lives here.
+ * Renders the HTML pages served *inside* the OAuth popup window
+ * (window.open target) for a given identity provider.
+ *
+ * The popup always ends its life by posting a `window.postMessage`
+ * payload back to `window.opener` (the taskpane/web app) and then
+ * closing itself. The `type` string in that payload is a contract
+ * with the frontend listener — see Frontend/src/taskpane/taskpane.js
+ * `AuthService.openGooglePopup()` / `openMicrosoftPopup()`.
+ *
+ * IMPORTANT: message types are NOT simply `${provider}_authed` for
+ * every provider — the Microsoft listener only recognises
+ * `ms_cancelled` (not `microsoft_cancelled`) for the logout/cancel
+ * event. MESSAGE_TYPES below is the single source of truth so a
+ * future provider can't silently break that contract.
  * ----------------------------------------------------------------
  */
-class AuthController {
 
-    // ----------------------------------------------------------------
-    // POST /api/auth/signup
-    // ----------------------------------------------------------------
-    async signup(req, res) {
-        try {
-            const { valid, errors } = AuthValidation.validateSignup(req.body);
-            if (!valid) {
-                return res.status(400).json({ success: false, message: errors.join(', ') });
-            }
-
-            const { name, email, password } = req.body;
-            const result = await AuthService.signup(name, email, password);
-
-            return res.status(201).json({
-                success: true,
-                token:   result.token,
-                user:    result.user
-            });
-        } catch (error) {
-            logger.error('Signup error', error.message);
-            return res.status(400).json({ success: false, message: error.message });
-        }
+const MESSAGE_TYPES = {
+    google: {
+        authed:    'google_authed',
+        cancelled: 'google_cancelled',
+        error:     'google_error',
+        label:     'Google'
+    },
+    microsoft: {
+        authed:    'microsoft_authed',
+        cancelled: 'ms_cancelled',
+        error:     'microsoft_error',
+        label:     'Microsoft'
     }
+};
 
-    // ----------------------------------------------------------------
-    // POST /api/auth/login
-    // ----------------------------------------------------------------
-    async login(req, res) {
-        try {
-            const { valid, errors } = AuthValidation.validateLogin(req.body);
-            if (!valid) {
-                return res.status(400).json({ success: false, message: errors.join(', ') });
-            }
-
-            const { email, password } = req.body;
-            const result = await AuthService.login(email, password);
-
-            return res.status(200).json({
-                success: true,
-                token:   result.token,
-                user:    result.user
-            });
-        } catch (error) {
-            logger.error('Login error', error.message);
-            return res.status(401).json({ success: false, message: error.message });
-        }
+function messageTypesFor(provider) {
+    const types = MESSAGE_TYPES[provider];
+    if (!types) {
+        throw new Error(`OAuthPopupView: unknown provider "${provider}"`);
     }
+    return types;
+}
 
-    // ----------------------------------------------------------------
-    // GET /api/auth/google/connect
-    // ----------------------------------------------------------------
-    googleConnect(req, res) {
-        try {
-            const authUrl = AuthService.getGoogleAuthUrl();
-            res.redirect(authUrl);
-        } catch (error) {
-            logger.error('Error generating Google OAuth URL', error);
-            res.status(500).json({ success: false, message: 'Failed to generate authorisation URL' });
-        }
-    }
+class OAuthPopupView {
 
-    // ----------------------------------------------------------------
-    // GET /api/auth/google/callback
-    // ----------------------------------------------------------------
-    async googleCallback(req, res) {
-        try {
-            const { code } = req.query;
-            if (!code) throw new Error('No authorisation code provided');
+    /**
+     * Returning user who already has an active subscription plan.
+     * Shows a brief "Welcome back" message, then posts the authed
+     * payload and closes.
+     *
+     * @param {{ provider: string, email: string, name: string, plan: string, subId: string, token: string }} data
+     * @returns {string} HTML document
+     */
+    static renderWelcomeBack({ provider, email, name, plan, subId, token }) {
+        const { authed, label } = messageTypesFor(provider);
 
-            const { user, token } = await AuthService.handleGoogleCallback(code);
-
-            const email  = user.email;
-            const name   = user.name;
-            const avatar = name.charAt(0).toUpperCase();
-            const subId  = 'FA-SUB-' + Math.floor(100000 + Math.random() * 900000);
-
-            if (user.plan) {
-                return res.send(`<!DOCTYPE html>
+        return `<!DOCTYPE html>
 <html>
   <head><script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script></head>
   <body style="background:#f4f5f7; display:flex; align-items:center; justify-content:center; height:100vh; font-family:sans-serif;">
     <div style="text-align:center;">
       <h2 style="color:#172b56;">Welcome back!</h2>
-      <p style="color:#6b7a9a;">You already have an active ${user.plan} subscription.</p>
-      <p style="color:#6b7a9a; font-size:12px;">Logging you in...</p>
+      <p style="color:#6b7a9a;">You already have an active ${plan} subscription.</p>
+      <p style="color:#6b7a9a; font-size:12px;">Logging you in via ${label}...</p>
     </div>
     <script>
       var payload = {
-        type:           'google_authed',
+        type:           '${authed}',
         email:          '${email}',
         name:           '${name}',
         subscriptionId: '${subId}',
-        plan:           '${user.plan}',
+        plan:           '${plan}',
         billingCycle:   'monthly',
         token:          '${token}'
       };
@@ -123,12 +87,23 @@ class AuthController {
       }, 1500);
     </script>
   </body>
-</html>`);
-            }
+</html>`;
+    }
 
-            // Render the full onboarding flow (Plans → Payment → Success) inside
-            // the popup. After payment, postMessage to the taskpane or web app.
-            return res.send(`<!DOCTYPE html>
+    /**
+     * New user (or returning user without a plan yet) — renders the
+     * full onboarding flow (Plans -> Payment -> Success) inside the
+     * popup. On completion it persists the chosen plan via
+     * PATCH /api/auth/update-plan and posts the authed payload.
+     *
+     * @param {{ provider: string, email: string, name: string, subId: string, token: string }} data
+     * @returns {string} HTML document
+     */
+    static renderPlansFlow({ provider, email, name, subId, token }) {
+        const { authed, cancelled, label } = messageTypesFor(provider);
+        const avatar = (name || email || 'U').charAt(0).toUpperCase();
+
+        return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -148,8 +123,6 @@ class AuthController {
       font-size: 14px;
       -webkit-font-smoothing: antialiased;
     }
-
-    /* ---- HEADER ---- */
     .header {
       background: #172b56;
       padding: 12px 20px;
@@ -198,18 +171,12 @@ class AuthController {
       font-family: inherit;
     }
     .logout-link:hover { background: rgba(255,77,77,0.15); border-color: rgba(255,77,77,0.3); color: #ff9a9a; }
-
-    /* ---- SCREEN SYSTEM ---- */
     .screen { display: none; flex: 1; flex-direction: column; }
     .screen.active { display: flex; }
-
-    /* ---- PLANS SCREEN ---- */
     .plans-wrap { flex: 1; overflow-y: auto; padding: 20px; }
     .plans-intro { text-align: center; margin-bottom: 16px; }
     .plans-intro h2 { font-size: 18px; font-weight: 800; color: #1a2035; margin-bottom: 4px; }
     .plans-intro p { font-size: 12px; color: #6b7a9a; }
-
-    /* billing toggle */
     .billing-row {
       display: flex; align-items: center; justify-content: center;
       gap: 8px; margin-bottom: 18px;
@@ -235,8 +202,6 @@ class AuthController {
       font-size: 9px; font-weight: 700;
       padding: 3px 7px; border-radius: 20px;
     }
-
-    /* plan cards */
     .cards { display: flex; flex-direction: column; gap: 12px; }
     .card {
       background: #f8f9fc;
@@ -268,7 +233,6 @@ class AuthController {
     .price-curr { font-size: 14px; font-weight: 700; color: #1a2035; }
     .price-amt { font-size: 28px; font-weight: 800; color: #1a2035; line-height: 1; }
     .price-period { font-size: 11px; color: #6b7a9a; margin-left: 2px; }
-    .price-custom { font-size: 20px; font-weight: 800; color: #1a2035; }
     .feats { list-style: none; margin-bottom: 12px; }
     .feats li { font-size: 11px; color: #4a5a7a; margin-bottom: 5px; }
     .card-btn {
@@ -287,8 +251,6 @@ class AuthController {
     .btn-ent { background: #f0f9ff; color: #0369a1; border: 1.5px solid #bae6fd; }
     .btn-ent:hover { background: #e0f2fe; }
     .secure-note { text-align: center; font-size: 10px; color: #8a98b8; margin-top: 14px; padding-bottom: 4px; }
-
-    /* ---- PAYMENT SCREEN ---- */
     .pay-wrap { flex: 1; overflow-y: auto; padding: 20px; }
     .back-btn {
       background: none; border: none; color: #2459dd;
@@ -345,8 +307,6 @@ class AuthController {
     .pay-btn:hover { box-shadow: 0 6px 20px rgba(36,89,221,0.3); transform: translateY(-1px); }
     .pay-btn:disabled { opacity: 0.7; cursor: not-allowed; transform: none; }
     .secure-badge { text-align: center; font-size: 10px; color: #8a98b8; margin-top: 10px; }
-
-    /* ---- PROCESSING SCREEN ---- */
     .processing-wrap {
       flex: 1; display: flex; flex-direction: column;
       align-items: center; justify-content: center; gap: 16px;
@@ -362,8 +322,6 @@ class AuthController {
     @keyframes spin { to { transform: rotate(360deg); } }
     .proc-title { font-size: 16px; font-weight: 700; color: #1a2035; }
     .proc-sub { font-size: 12px; color: #8a98b8; }
-
-    /* ---- SUCCESS SCREEN ---- */
     .success-wrap {
       flex: 1; display: flex; flex-direction: column;
       align-items: center; justify-content: center; gap: 14px;
@@ -406,7 +364,6 @@ class AuthController {
 </head>
 <body>
 
-  <!-- STICKY HEADER -->
   <div class="header">
     <div class="header-left">
       <div class="logo">FA</div>
@@ -424,7 +381,6 @@ class AuthController {
     </div>
   </div>
 
-  <!-- SCREEN 1: PLANS -->
   <div id="screenPlans" class="screen active">
     <div class="plans-wrap">
       <div class="plans-intro">
@@ -443,7 +399,6 @@ class AuthController {
       </div>
 
       <div class="cards">
-        <!-- Basic -->
         <div class="card" id="cardBasic">
           <div class="card-head">
             <span class="card-icon">🌱</span>
@@ -462,7 +417,6 @@ class AuthController {
           <button class="card-btn btn-starter" onclick="selectPlan('Basic', 699, 599)">Get Started</button>
         </div>
 
-        <!-- Standard -->
         <div class="card" id="cardStandard">
           <div class="card-head">
             <span class="card-icon">🚀</span>
@@ -481,7 +435,6 @@ class AuthController {
           <button class="card-btn btn-ent" onclick="selectPlan('Standard', 1299, 1199)">Get Started</button>
         </div>
 
-        <!-- Pro -->
         <div class="card featured" id="cardPro">
           <div class="popular-tag">MOST POPULAR</div>
           <div class="card-head">
@@ -506,7 +459,6 @@ class AuthController {
     </div>
   </div>
 
-  <!-- SCREEN 2: PAYMENT -->
   <div id="screenPayment" class="screen">
     <div class="pay-wrap">
       <button class="back-btn" onclick="showScreen('Plans')">← Back to Plans</button>
@@ -561,7 +513,6 @@ class AuthController {
     </div>
   </div>
 
-  <!-- SCREEN 3: PROCESSING -->
   <div id="screenProcessing" class="screen">
     <div class="processing-wrap">
       <div class="proc-spinner"></div>
@@ -570,7 +521,6 @@ class AuthController {
     </div>
   </div>
 
-  <!-- SCREEN 4: SUCCESS -->
   <div id="screenSuccess" class="screen">
     <div class="success-wrap">
       <div class="success-icon-wrap">
@@ -601,7 +551,6 @@ class AuthController {
       Pro:      { monthly: 1999, yearly: 1899 }
     };
 
-    /* Billing toggle */
     var toggle = document.getElementById('billingToggle');
     toggle.addEventListener('change', function() {
       isYearly = toggle.checked;
@@ -612,13 +561,11 @@ class AuthController {
       document.getElementById('proAmt').textContent      = isYearly ? prices.Pro.yearly      : prices.Pro.monthly;
     });
 
-    /* Screen switcher */
     function showScreen(id) {
       document.querySelectorAll('.screen').forEach(function(s) { s.classList.remove('active'); });
       document.getElementById('screen' + id).classList.add('active');
     }
 
-    /* Plan selection */
     function selectPlan(plan, monthly, yearly) {
       selectedPlan  = plan;
       selectedPrice = isYearly ? yearly : monthly;
@@ -629,20 +576,17 @@ class AuthController {
       showScreen('Payment');
     }
 
-    /* Card number formatting */
     function formatCard(input) {
       var v = input.value.replace(/\\D/g, '').substring(0, 16);
       input.value = v.replace(/(.{4})/g, '$1 ').trim();
     }
 
-    /* Expiry formatting */
     function formatExp(input) {
       var v = input.value.replace(/\\D/g, '').substring(0, 4);
       if (v.length >= 2) v = v.substring(0,2) + ' / ' + v.substring(2);
       input.value = v;
     }
 
-    /* Mock payment processing */
     function processPayment() {
       var name = document.getElementById('cardName').value.trim();
       var num  = document.getElementById('cardNum').value.trim();
@@ -659,7 +603,6 @@ class AuthController {
       setTimeout(function() { showScreen('Success'); }, 2200);
     }
 
-    /* Send authed message to taskpane / web app and close */
     async function finishFlow() {
       try {
         await fetch('/api/auth/update-plan', {
@@ -675,7 +618,7 @@ class AuthController {
       }
 
       var payload = {
-        type:           'google_authed',
+        type:           '${authed}',
         email:          '${email}',
         name:           '${name}',
         subscriptionId: '${subId}',
@@ -693,10 +636,9 @@ class AuthController {
       }
     }
 
-    /* Logout — close popup and signal cancel */
     function doLogout() {
-      if (confirm('Log out of this Google account?')) {
-        var payload = { type: 'google_cancelled' };
+      if (confirm('Log out of this ${label} account?')) {
+        var payload = { type: '${cancelled}' };
         if (window.opener) {
           window.opener.postMessage(payload, '*');
           window.close();
@@ -710,138 +652,36 @@ class AuthController {
   </script>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
 </body>
-</html>`);
-        } catch (error) {
-            logger.error('Google OAuth callback failed', error.response?.data || error.message);
-            return res.send(`<!DOCTYPE html>
+</html>`;
+    }
+
+    /**
+     * Terminal error page shown inside the popup when the OAuth
+     * exchange or profile lookup fails.
+     *
+     * @param {{ provider: string, message: string }} data
+     * @returns {string} HTML document
+     */
+    static renderError({ provider, message }) {
+        const { error } = messageTypesFor(provider);
+        const safeMessage = String(message || 'Unknown error').replace(/'/g, "\\'");
+
+        return `<!DOCTYPE html>
 <html>
   <body style="background:#1a0000;color:#ffaaaa;font-family:sans-serif;text-align:center;padding:40px;">
     <div style="font-size:24px;">❌ Sign-in failed</div>
-    <div style="margin-top:10px;font-size:13px;">${error.message}</div>
+    <div style="margin-top:10px;font-size:13px;">${safeMessage}</div>
     <script>
       setTimeout(function() {
-        if (window.opener) { window.opener.postMessage({ type: 'google_error', message: '${error.message}' }, '*'); window.close(); }
-        else if (typeof Office !== 'undefined') { Office.onReady(function() { Office.context.ui.messageParent(JSON.stringify({ type: 'google_error' })); }); }
+        if (window.opener) { window.opener.postMessage({ type: '${error}', message: '${safeMessage}' }, '*'); window.close(); }
+        else if (typeof Office !== 'undefined') { Office.onReady(function() { Office.context.ui.messageParent(JSON.stringify({ type: '${error}' })); }); }
         else { window.close(); }
       }, 2000);
-    <\/script>
-    <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"><\/script>
+    </script>
+    <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   </body>
-</html>`);
-        }
-    }
-
-    // ----------------------------------------------------------------
-    // GET /api/microsoft/connect  (aliased at /api/auth/microsoft/connect)
-    // ----------------------------------------------------------------
-    microsoftConnect(req, res) {
-        try {
-            const authUrl = AuthService.getMicrosoftAuthUrl();
-            res.redirect(authUrl);
-        } catch (error) {
-            logger.error('Error generating Microsoft OAuth URL', error);
-            res.status(500).json({ success: false, message: 'Failed to generate authorisation URL' });
-        }
-    }
-
-    // ----------------------------------------------------------------
-    // GET /api/microsoft/callback  (aliased at /api/auth/microsoft/callback)
-    // ----------------------------------------------------------------
-    async microsoftCallback(req, res) {
-        try {
-            const { code, error: oauthError, error_description: oauthErrorDescription } = req.query;
-            if (oauthError) {
-                throw new Error(oauthErrorDescription || oauthError);
-            }
-            if (!code) throw new Error('No authorisation code provided');
-
-            const { user, token } = await AuthService.handleMicrosoftCallback(code);
-
-            const email = user.email;
-            const name  = user.name;
-            const subId = 'FA-SUB-' + Math.floor(100000 + Math.random() * 900000);
-
-            if (user.plan) {
-                return res.send(OAuthPopupView.renderWelcomeBack({
-                    provider: 'microsoft', email, name, plan: user.plan, subId, token
-                }));
-            }
-
-            return res.send(OAuthPopupView.renderPlansFlow({
-                provider: 'microsoft', email, name, subId, token
-            }));
-        } catch (error) {
-            logger.error('Microsoft OAuth callback failed', error.response?.data || error.message);
-            return res.send(OAuthPopupView.renderError({
-                provider: 'microsoft', message: error.message
-            }));
-        }
-    }
-
-    // ----------------------------------------------------------------
-    // GET /api/auth/me   (protected)
-    // ----------------------------------------------------------------
-    async getMe(req, res) {
-        try {
-            const user = await UserRepository.findById(req.user.userId);
-            if (!user) {
-                return res.status(404).json({ success: false, message: 'User not found' });
-            }
-            return res.json({
-                success: true,
-                user: {
-                    id:       user.id,
-                    name:     user.name,
-                    email:    user.email,
-                    role:     user.role,
-                    provider: user.provider,
-                    plan:     user.plan
-                }
-            });
-        } catch (error) {
-            logger.error('getMe error', error.message);
-            return res.status(500).json({ success: false, message: 'Internal server error' });
-        }
-    }
-
-    // ----------------------------------------------------------------
-    // POST /api/auth/update-plan
-    // ----------------------------------------------------------------
-    async updatePlan(req, res) {
-        try {
-            const { plan } = req.body;
-            if (!plan) {
-                return res.status(400).json({ success: false, message: 'Plan is required' });
-            }
-
-            const user = await UserRepository.findById(req.user.userId);
-            const oldPlan = user ? user.plan : null;
-
-            const planWeights = {
-                'basic': 1,
-                'standard': 2,
-                'pro': 3
-            };
-
-            const oldPlanKey = (oldPlan || 'Pro').toLowerCase();
-            const newPlanKey = plan.toLowerCase();
-            const isDowngrade = (planWeights[newPlanKey] || 0) < (planWeights[oldPlanKey] || 0);
-
-            await UserRepository.update(req.user.userId, { plan });
-
-            if (isDowngrade && req.user.email) {
-                const { QuickBooksToken, XeroToken } = require('../../core/database');
-                await QuickBooksToken.destroy({ where: { mail: req.user.email } });
-                await XeroToken.destroy({ where: { mail: req.user.email } });
-                logger.info(`User ${req.user.userId} downgraded from ${oldPlan} to ${plan}. Cleared company connections.`);
-            }
-
-            return res.json({ success: true, message: 'Plan updated successfully' });
-        } catch (error) {
-            logger.error('updatePlan error', error.message);
-            return res.status(500).json({ success: false, message: 'Internal server error' });
-        }
+</html>`;
     }
 }
 
-module.exports = new AuthController();
+module.exports = OAuthPopupView;

@@ -5,7 +5,7 @@ const { DataTypes } = require('sequelize');
  * ----------------------------------------------------------------
  * Shared users table used by all authentication providers.
  *
- * provider values: 'local' | 'google'
+ * provider values: 'local' | 'google' | 'microsoft'
  * role    values: 'user'  | 'admin'  (defaults to 'user')
  * ----------------------------------------------------------------
  */
@@ -37,13 +37,19 @@ module.exports = (sequelize) => {
             },
 
             provider: {
-                type:         DataTypes.ENUM('local', 'google'),
+                type:         DataTypes.ENUM('local', 'google', 'microsoft'),
                 allowNull:    false,
                 defaultValue: 'local'
             },
 
             // Populated for Google OAuth users
             google_id: {
+                type:      DataTypes.STRING,
+                allowNull: true
+            },
+
+            // Populated for Microsoft Entra ID (Azure AD) OAuth users
+            microsoft_id: {
                 type:      DataTypes.STRING,
                 allowNull: true
             },

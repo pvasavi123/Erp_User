@@ -1,10 +1,11 @@
 'use strict';
 
-const bcrypt         = require('bcrypt');
-const UserRepository = require('./user.repository');
-const JwtService     = require('./jwt.service');
-const GoogleService  = require('./google.service');
-const logger         = require('../../core/logger');
+const bcrypt           = require('bcrypt');
+const UserRepository   = require('./user.repository');
+const JwtService       = require('./jwt.service');
+const GoogleService    = require('./google.service');
+const MicrosoftService = require('./microsoft.service');
+const logger           = require('../../core/logger');
 
 /**
  * AuthService
@@ -186,6 +187,80 @@ class AuthService {
             token:     AuthService._buildToken(user),
             user:      AuthService._toUserDTO(user),
             isNewUser: user.provider === 'google' && !user.password_hash
+        };
+    }
+
+    // ----------------------------------------------------------------
+    // Microsoft Entra ID (Azure AD) OAuth
+    // ----------------------------------------------------------------
+
+    /**
+     * Return the Microsoft Entra ID OAuth 2.0 authorisation URL to
+     * redirect the browser to.
+     * @returns {string}
+     */
+    static getMicrosoftAuthUrl() {
+        return MicrosoftService.getAuthUrl();
+    }
+
+    /**
+     * Handle the Microsoft Entra ID OAuth callback.
+     * - Exchanges the code for tokens.
+     * - Fetches the Microsoft Graph profile.
+     * - Upserts the user in the database (create if new, update
+     *   microsoft_id if returning).
+     * - Returns the user DTO and JWT.
+     *
+     * @param {string} code   OAuth2 authorisation code from query string.
+     * @returns {Promise<{ token: string, user: UserDTO, isNewUser: boolean }>}
+     */
+    static async handleMicrosoftCallback(code) {
+        const tokens  = await MicrosoftService.exchangeCodeForToken(code);
+        const profile = await MicrosoftService.getUserProfile(tokens.access_token);
+
+        const microsoftId = profile.sub;
+        const email        = (profile.email || '').toLowerCase().trim();
+        const name          = profile.name || profile.email || 'User';
+
+        if (!email) {
+            throw new Error('Microsoft account has no email or userPrincipalName to sign in with');
+        }
+
+        // 1. Try to find by Microsoft ID (fastest, most stable)
+        let user = await UserRepository.findByMicrosoftId(microsoftId);
+
+        // 2. Fall back to email lookup (handles users who signed up locally
+        //    or with Google first)
+        if (!user) {
+            user = await UserRepository.findByEmail(email);
+        }
+
+        if (user) {
+            // Returning user — ensure microsoft_id is persisted if missing
+            if (!user.microsoft_id) {
+                user = await UserRepository.update(user.id, {
+                    microsoft_id: microsoftId,
+                    provider:     'microsoft'
+                });
+            }
+        } else {
+            // New user — create account
+            user = await UserRepository.create({
+                name,
+                email,
+                provider:     'microsoft',
+                microsoft_id: microsoftId,
+                role:         'user'
+            });
+        }
+
+        const isNewUser = !user.created_at ||
+            (new Date() - new Date(user.created_at)) < 5000;
+
+        return {
+            token:     AuthService._buildToken(user),
+            user:      AuthService._toUserDTO(user),
+            isNewUser: user.provider === 'microsoft' && !user.password_hash
         };
     }
 }

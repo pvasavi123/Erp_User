@@ -1,0 +1,53 @@
+const Module = require('module');
+const path = require('path');
+const fs = require('fs');
+const originalResolve = Module._resolveFilename;
+
+const dbStubPath = path.resolve(__dirname, '__db_stub__.js');
+fs.writeFileSync(dbStubPath, `
+module.exports = {
+  sequelize: { define: () => ({}) },
+  QuickBooksToken: {},
+  XeroToken: {},
+  User: { findOne: async () => null, findByPk: async () => null, findAll: async () => [], create: async () => ({}), update: async () => [0] },
+  Admin: {}
+};
+`);
+
+Module._resolveFilename = function (request, parent, ...rest) {
+  const resolved = originalResolve.call(this, request, parent, ...rest);
+  if (resolved.endsWith(path.join('core', 'database', 'index.js'))) {
+    return dbStubPath;
+  }
+  return resolved;
+};
+
+const express = require('express');
+const microsoftRoutes = require('./src/modules/microsoft/routes.js');
+const authRoutes = require('./src/modules/auth/auth.routes.js');
+
+const app = express();
+app.use('/api/microsoft', microsoftRoutes);
+app.use('/api/auth', authRoutes);
+
+function walk(stack, prefix) {
+  stack.forEach((layer) => {
+    if (layer.route) {
+      const methods = Object.keys(layer.route.methods).join(',').toUpperCase();
+      console.log(methods.padEnd(6), prefix + layer.route.path);
+    } else if (layer.name === 'router' && layer.handle && layer.handle.stack) {
+      let seg = '';
+      const src = layer.regexp && layer.regexp.source;
+      if (src) {
+        const m = src.match(/\^\\\/([A-Za-z0-9_-]+)/);
+        if (m) seg = '/' + m[1];
+      }
+      walk(layer.handle.stack, prefix + seg);
+    }
+  });
+}
+
+walk(app._router.stack, '');
+console.log('MICROSOFT_CONNECT_TYPEOF', typeof microsoftRoutes);
+fs.unlinkSync(dbStubPath);
+console.log('SMOKE_TEST_OK');

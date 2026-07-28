@@ -15,6 +15,8 @@ const { authenticate } = require('./auth.middleware');
  *   POST /api/auth/login
  *   GET  /api/auth/google/connect
  *   GET  /api/auth/google/callback
+ *   GET  /api/auth/microsoft/connect
+ *   GET  /api/auth/microsoft/callback
  *
  * Protected (JWT required):
  *   GET  /api/auth/me
@@ -28,6 +30,10 @@ router.post('/login',  controller.login);
 // Google OAuth
 router.get('/google/connect',  controller.googleConnect);
 router.get('/google/callback', controller.googleCallback);
+
+// Microsoft Entra ID (Azure AD) OAuth
+router.get('/microsoft/connect',  controller.microsoftConnect);
+router.get('/microsoft/callback', controller.microsoftCallback);
 
 // Protected endpoints
 router.get('/me', authenticate, controller.getMe);

@@ -40,8 +40,17 @@ class UserRepository {
     }
 
     /**
+     * Find a user by their Microsoft Entra ID (Azure AD) subject ID.
+     * @param {string} microsoftId
+     * @returns {Promise<User|null>}
+     */
+    static async findByMicrosoftId(microsoftId) {
+        return await User.findOne({ where: { microsoft_id: microsoftId } });
+    }
+
+    /**
      * Create a new user record.
-     * @param {{ name, email, password_hash?, provider, google_id?, role? }} data
+     * @param {{ name, email, password_hash?, provider, google_id?, microsoft_id?, role? }} data
      * @returns {Promise<User>}
      */
     static async create(data) {
