@@ -1,0 +1,2355 @@
+/**
+ * FinAccrual Excel Add-in Taskpane Application
+ *
+ * Architecture: Modern Multi-View SaaS Design
+ *
+ * Namespaces:
+ *  - AppState      : Centralized reactive application state
+ *  - ViewRouter    : Multi-view screen navigation controller
+ *  - ApiService    : Backend API calls (auth, subscription, ERP tokens)
+ *  - ExcelService  : Excel JS workbook sheet management
+ *  - AuthService   : Google / Microsoft OAuth popup handlers
+ *  - DashboardService : Dashboard UI rendering and ERP operations
+ *  - AppController : Event binding, session restoration, init
+ */
+
+Office.onReady(() => {
+
+    // ============================================================
+    // 1. CENTRALIZED APPLICATION STATE
+    // ============================================================
+    const AppState = {
+        // Auth / Subscription
+        userEmail:        localStorage.getItem("fa_user_email")  || null,
+        userName:         localStorage.getItem("fa_user_name")   || null,
+        userProvider:     localStorage.getItem("fa_user_provider") || null,
+        hasSubscription:  localStorage.getItem("fa_has_subscription") === "true",
+        subscriptionId:   localStorage.getItem("fa_subscription_id")   || null,
+        subscriptionPlan: (v => (!v || v === 'null' || v === 'undefined') ? null : v)(localStorage.getItem("fa_subscription_plan")),
+
+        // Pending checkout details (set when user selects a plan)
+        pendingPlan:      null,
+        pendingPrice:     null,
+        pendingCycle:     null,
+
+        // ERP Connection
+        erpConnected:     localStorage.getItem("fa_erp_connected") === "true",
+        erpType:          localStorage.getItem("fa_erp_type") || null,        // "quickbooks" | "xero"
+        erpOrgName:       localStorage.getItem("fa_erp_org")  || null,
+        erpConnectedDate: localStorage.getItem("fa_erp_date") || null,
+        forceWelcome:     false,
+
+        // ERP Operations
+        currentProvider: "quickbooks",
+        get currentTier() {
+            const plan = (AppState.subscriptionPlan || "pro").toLowerCase();
+            if (plan.includes("basic")) return "basic";
+            if (plan.includes("standard")) return "standard";
+            return "pro";
+        },
+        connectionId:    null,
+        isConnected:     false
+    };
+
+    // ============================================================
+    // 2. VIEW ROUTER
+    // ============================================================
+    const ViewRouter = {
+        /**
+         * Shows a view by its ID name (e.g. "Welcome", "Dashboard")
+         * @param {string} name - View name that maps to #view<Name>
+         */
+        show(name) {
+            document.querySelectorAll(".view").forEach(v => v.classList.remove("active"));
+            const el = document.getElementById("view" + name);
+            if (el) el.classList.add("active");
+            if (name && name !== "Loading" && name !== "Error") {
+                localStorage.setItem("fa_last_view", name);
+            }
+            if (name === "Plans") {
+                const nameVal = AppState.userName || AppState.userEmail || "User";
+                const initial = nameVal.charAt(0).toUpperCase();
+                const avatarEl = document.getElementById("plansUserAvatar");
+                const emailEl = document.getElementById("plansUserEmail");
+                if (avatarEl) avatarEl.textContent = initial;
+                if (emailEl) emailEl.textContent = AppState.userEmail || "";
+            }
+        }
+    };
+
+    // ============================================================
+    // 3. API SERVICE LAYER
+    // ============================================================
+    const ApiService = {
+        BASE: "http://localhost:8000",
+
+        /**
+         * Checks subscription status for the given email from backend.
+         * Falls back gracefully if backend is down (for UI-only phase).
+         */
+        async checkSubscription(email) {
+            try {
+                const res = await fetch(`${this.BASE}/api/auth/login`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ email })
+                });
+                if (!res.ok) return { hasSubscription: false };
+                return await res.json();
+            } catch {
+                return { hasSubscription: AppState.hasSubscription };
+            }
+        },
+
+        /** Checks ERP token validity from backend. */
+        async checkTokens(provider) {
+            const url = provider === "quickbooks"
+                ? `${this.BASE}/api/quickbooks/tokens/`
+                : `${this.BASE}/api/xero/tokens`;
+            const res = await fetch(url);
+            if (!res.ok) throw new Error(`Failed to check ${provider} tokens.`);
+            return await res.json();
+        },
+
+        /** Disconnects the ERP provider from backend. */
+        async disconnectERP(provider) {
+            const url = provider === "quickbooks"
+                ? `${this.BASE}/api/quickbooks/disconnect`
+                : `${this.BASE}/api/xero/disconnect`;
+            const res = await fetch(url, { method: "POST" });
+            if (!res.ok) throw new Error(`Failed to disconnect ${provider}.`);
+            return await res.json();
+        },
+
+        /**
+         * Pulls master metadata from ERP APIs via the unified backend pull endpoint.
+         * @param {string} provider - The active ERP provider ("quickbooks" | "xero")
+         * @param {string} companyId - Selected company identifier
+         * @returns {Promise<object>} Map of company, customers, vendors, accounts, classes, locations
+         */
+        async fetchMasterData(provider, companyId) {
+            const res = await fetch(`${this.BASE}/api/pull-master-data`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ companyId, platform: provider, tier: AppState.currentTier })
+            });
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(err.error || `Failed to fetch master data for company ${companyId}`);
+            }
+            return await res.json();
+        }
+    };
+
+    // ============================================================
+    // 4. EXCEL SERVICE LAYER
+    // ============================================================
+    const ExcelService = {
+        /**
+         * Populates Excel workbook sheet "1.Master_Data" with ERP payload.
+         * @param {string} provider - Active ERP provider
+         * @param {object} data - Master data payload
+         */
+        async writeMasterData(provider, data) {
+            await Excel.run(async (context) => {
+                const sheet = context.workbook.worksheets.getItem("1.Master_Data");
+
+                // Clear existing records in spreadsheet grid below headers
+                const clearRange = sheet.getRange("A2:AB10000");
+                clearRange.clear("Contents");
+
+                // Group all data by Organization
+                const orgGroupsMap = new Map();
+                const fallbackOrgName = provider === "quickbooks" ? "QuickBooks Company" : "Xero Organisation";
+
+                const getOrCreateGroup = (id, name) => {
+                    const cleanName = (name && name !== "Default" && name !== "Default Organization") ? name : fallbackOrgName;
+                    const key       = cleanName.trim();
+
+                    if (!orgGroupsMap.has(key)) {
+                        orgGroupsMap.set(key, {
+                            id: cleanName,
+                            name: cleanName,
+                            accounts: [],
+                            classes: [],
+                            locations: [],
+                            entities: []
+                        });
+                    }
+                    return orgGroupsMap.get(key);
+                };
+
+                // 1. Group Companies
+                const rawCompanies = Array.isArray(data.company) 
+                    ? data.company 
+                    : (data.company ? [data.company] : []);
+                
+                for (const c of rawCompanies) {
+                    if (c) getOrCreateGroup(c.name || c.id, c.name);
+                }
+
+                // 2. Group Accounts
+                if (data.accounts) {
+                    for (const a of data.accounts) {
+                        const nameKey = a.clientName || a.clientId || fallbackOrgName;
+                        const group = getOrCreateGroup(a.clientId, nameKey);
+                        group.accounts.push(a);
+                    }
+                }
+
+                // 3. Group Classes
+                if (data.classes) {
+                    for (const c of data.classes) {
+                        const nameKey = c.clientName || c.clientId || fallbackOrgName;
+                        const group = getOrCreateGroup(c.clientId, nameKey);
+                        group.classes.push(c);
+                    }
+                }
+
+                // 4. Group Locations
+                if (data.locations) {
+                    for (const l of data.locations) {
+                        const nameKey = l.clientName || l.clientId || fallbackOrgName;
+                        const group = getOrCreateGroup(l.clientId, nameKey);
+                        group.locations.push(l);
+                    }
+                }
+
+                // 5. Group Entities (Customers and Vendors)
+                if (data.customers) {
+                    for (const cust of data.customers) {
+                        const nameKey = cust.clientName || cust.clientId || fallbackOrgName;
+                        const group = getOrCreateGroup(cust.clientId, nameKey);
+                        group.entities.push({
+                            clientId: nameKey,
+                            name: cust.name || cust.DisplayName || cust.Name || "",
+                            type: "Customer",
+                            id: cust.id || cust.Id || cust.ContactID || "",
+                            status: cust.active !== undefined ? (cust.active ? "Active" : "Inactive") : "Active"
+                        });
+                    }
+                }
+
+                if (data.vendors) {
+                    for (const vend of data.vendors) {
+                        const nameKey = vend.clientName || vend.clientId || fallbackOrgName;
+                        const group = getOrCreateGroup(vend.clientId, nameKey);
+                        group.entities.push({
+                            clientId: nameKey,
+                            name: vend.name || vend.DisplayName || vend.Name || "",
+                            type: "Vendor",
+                            id: vend.id || vend.Id || vend.ContactID || "",
+                            status: vend.active !== undefined ? (vend.active ? "Active" : "Inactive") : "Active"
+                        });
+                    }
+                }
+
+                // Write grouped data sequentially with 2 blank rows between organizations
+                let currentRow = 2;
+
+                for (const [key, group] of orgGroupsMap) {
+                    const orgName = group.name; // Client ID and Client Name are identical
+
+                    const accCount    = group.accounts.length;
+                    const classCount  = group.classes.length;
+                    const locCount    = group.locations.length;
+                    const entityCount = group.entities.length;
+
+                    const maxRows = Math.max(1, accCount, classCount, locCount, entityCount);
+
+                    // Section 1 (A:B) - Client Config (Client ID and Client Name SAME)
+                    sheet.getRange(`A${currentRow}:B${currentRow}`).values = [[orgName, orgName]];
+
+                    // Section 2 (D:L) - Accounts
+                    if (accCount > 0) {
+                        const accValues = group.accounts.map(a => [
+                            orgName,
+                            a.acctNum || a.code || a.AcctNum || a.Code || "",
+                            a.name || a.Name || "",
+                            a.accountType || a.type || a.AccountType || a.Type || "",
+                            a.accountSubType || a.description || a.AccountSubType || "",
+                            a.classification || a.Classification || "",
+                            a.fullyQualifiedName || a.name || a.Name || "",
+                            a.active !== undefined ? (a.active ? "Active" : "Inactive") : "Active",
+                            a.id || a.Id || a.AccountID || ""
+                        ]);
+                        sheet.getRange(`D${currentRow}:L${currentRow + accCount - 1}`).values = accValues;
+                    }
+
+                    // Section 3 (N:Q) - Classes
+                    if (classCount > 0) {
+                        const classValues = group.classes.map(c => [
+                            orgName,
+                            c.name || c.Name || "",
+                            c.id || c.Id || "",
+                            c.active !== undefined ? (c.active ? "Active" : "Inactive") : "Active"
+                        ]);
+                        sheet.getRange(`N${currentRow}:Q${currentRow + classCount - 1}`).values = classValues;
+                    }
+
+                    // Section 4 (S:V) - Locations
+                    if (locCount > 0) {
+                        const locValues = group.locations.map(l => [
+                            orgName,
+                            l.name || l.Name || "",
+                            l.id || l.Id || "",
+                            l.active !== undefined ? (l.active ? "Active" : "Inactive") : "Active"
+                        ]);
+                        sheet.getRange(`S${currentRow}:V${currentRow + locCount - 1}`).values = locValues;
+                    }
+
+                    // Section 5 (X:AB) - Entities
+                    if (entityCount > 0) {
+                        const entityValues = group.entities.map(e => [
+                            orgName,
+                            e.name,
+                            e.type,
+                            e.id,
+                            e.status
+                        ]);
+                        sheet.getRange(`X${currentRow}:AB${currentRow + entityCount - 1}`).values = entityValues;
+                    }
+
+                    // Advance currentRow by maxRows + 2 (providing 2 empty row spaces between organizations!)
+                    currentRow += maxRows + 2;
+                }
+
+                // Apply consistent font size and wrap text to prevent overlapping/truncation
+                const dataRange = sheet.getRange("A2:AB10000");
+                dataRange.format.font.size = 11;
+                dataRange.format.wrapText = true;
+
+                sheet.getRange("A:AB").format.columnWidth = 115;
+
+                await context.sync();
+            });
+        },
+
+        async clearMasterData() {
+            await Excel.run(async (context) => {
+                const masterSheet = context.workbook.worksheets.getItemOrNullObject("1.Master_Data");
+                const inputSheet  = context.workbook.worksheets.getItemOrNullObject("2.Input");
+                const sheets = context.workbook.worksheets;
+                sheets.load("items/name");
+                await context.sync();
+
+                let otherSheetExists = false;
+                for (let i = 0; i < sheets.items.length; i++) {
+                    const name = sheets.items[i].name;
+                    if (name !== "1.Master_Data" && name !== "2.Input") {
+                        otherSheetExists = true;
+                        sheets.items[i].activate();
+                        break;
+                    }
+                }
+                if (!otherSheetExists) {
+                    context.workbook.worksheets.add("Sheet1").activate();
+                }
+                if (!masterSheet.isNullObject) masterSheet.delete();
+                if (!inputSheet.isNullObject)  inputSheet.delete();
+                await context.sync();
+            });
+        },
+
+        async stampLastRefreshed(timestamp) {
+            await Excel.run(async (context) => {
+                const sheet = context.workbook.worksheets.getItem("1.Master_Data");
+                const cell = sheet.getRange("V1");
+                cell.values = [[`Last Refreshed: ${timestamp}`]];
+                cell.format.font.bold = true;
+                cell.format.font.color = "white";
+                await context.sync();
+            });
+        },
+
+        /**
+         * Scaffolds required sheets (1.Master_Data and 2.Input) and styles the header rows across 5 colored sections.
+         * @param {string} provider - Active ERP provider
+         */
+        async setupWorkbookSheets(provider) {
+            await Excel.run(async (context) => {
+                let masterSheet = context.workbook.worksheets.getItemOrNullObject("1.Master_Data");
+                let inputSheet  = context.workbook.worksheets.getItemOrNullObject("2.Input");
+                await context.sync();
+
+                if (masterSheet.isNullObject) masterSheet = context.workbook.worksheets.add("1.Master_Data");
+                if (inputSheet.isNullObject)  inputSheet  = context.workbook.worksheets.add("2.Input");
+
+                masterSheet.activate();
+                await context.sync();
+
+                const idLabel = provider === "quickbooks" ? "QBO" : "Xero";
+
+                // Generate spreadsheet header columns from A1 to AB1
+                const headerRange = masterSheet.getRange("A1:AB1");
+                const headers = [
+                    [
+                        "Client ID", "Client Name", "", 
+                        "Client ID", "Account Code", "Account Name", "Account Type", "Account Sub-Type", "Classification", "Fully Qualified Name", "Status", `${idLabel} Account Id`, "", 
+                        "Client ID", "Class Name", `${idLabel} Class Id`, "Status", "", 
+                        "Client ID", "Location Name", `${idLabel} Location Id`, "Status", "", 
+                        "Client ID", "Entity Name", "Entity Type", `${idLabel} Entity Id`, "Status"
+                    ]
+                ];
+
+                headerRange.clear();
+                headerRange.values = headers;
+                
+                // Format Navy Blue Section 1 Header Range (A1:B1)
+                const purpleRange1 = masterSheet.getRange("A1:B1");
+                purpleRange1.format.fill.color = "#1B224C";
+                purpleRange1.format.font.color = "white";
+                purpleRange1.format.font.bold = true;
+                purpleRange1.format.horizontalAlignment = "Center";
+                purpleRange1.format.verticalAlignment = "Center";
+                purpleRange1.format.borders.getItem("EdgeBottom").style = Excel.BorderLineStyle.Continuous;
+
+                // Format Navy Blue Section 2 Header Range (D1:L1)
+                const blueRange2 = masterSheet.getRange("D1:L1");
+                blueRange2.format.fill.color = "#1F4E79";
+                blueRange2.format.font.color = "white";
+                blueRange2.format.font.bold = true;
+                blueRange2.format.horizontalAlignment = "Center";
+                blueRange2.format.verticalAlignment = "Center";
+                blueRange2.format.borders.getItem("EdgeBottom").style = Excel.BorderLineStyle.Continuous;
+
+                // Format Green Section 3 & 4 Header Ranges (N1:Q1, S1:V1)
+                const greenRanges = ["N1:Q1", "S1:V1"];
+                for (const range of greenRanges) {
+                    const r = masterSheet.getRange(range);
+                    r.format.fill.color = "#0F7546";
+                    r.format.font.color = "white";
+                    r.format.font.bold = true;
+                    r.format.horizontalAlignment = "Center";
+                    r.format.verticalAlignment = "Center";
+                    r.format.borders.getItem("EdgeBottom").style = Excel.BorderLineStyle.Continuous;
+                }
+
+                // Format Dark Blue Section 5 Header Range (X1:AB1)
+                const purpleRange5 = masterSheet.getRange("X1:AB1");
+                purpleRange5.format.fill.color = "#1B224C";
+                purpleRange5.format.font.color = "white";
+                purpleRange5.format.font.bold = true;
+                purpleRange5.format.horizontalAlignment = "Center";
+                purpleRange5.format.verticalAlignment = "Center";
+                purpleRange5.format.borders.getItem("EdgeBottom").style = Excel.BorderLineStyle.Continuous;
+
+                // Configure spacer columns - clear formats
+                const spacers = ["C:C", "M:M", "R:R", "W:W"];
+                for (const spacer of spacers) {
+                    const col = masterSheet.getRange(spacer);
+                    col.clear("Formats");
+                }
+
+                headerRange.format.rowHeight = 28;
+                headerRange.format.font.size = 11;
+                headerRange.format.wrapText = true;
+                
+                // Set all columns in the range to column width 115
+                masterSheet.getRange("A:AB").format.columnWidth = 115;
+                
+                masterSheet.freezePanes.unfreeze();
+                masterSheet.getRange("A2").select();
+                
+                await context.sync();
+            });
+        }
+    };
+
+    // ============================================================
+    // 5. AUTH SERVICE
+    // ============================================================
+    const AuthService = {
+        /**
+         * Called when a new-user completes payment inside the popup.
+         * Receives full profile + subscription info from google_authed postMessage.
+         * @param {string} email
+         * @param {string} name
+         * @param {string} provider
+         * @param {string} subscriptionId
+         * @param {string} plan
+         */
+        handleNewUserAuthed(email, name, provider, subscriptionId, plan) {
+            AppState.userEmail        = email;
+            AppState.userName         = name;
+            AppState.userProvider     = provider;
+            AppState.hasSubscription  = true;
+            AppState.subscriptionId   = subscriptionId;
+            AppState.subscriptionPlan = plan;
+
+            localStorage.setItem("fa_user_email",      email);
+            localStorage.setItem("fa_user_name",       name);
+            localStorage.setItem("fa_user_provider",   provider);
+            this._persistSubscription();
+
+            DashboardService.render();
+            ViewRouter.show("Dashboard");
+        },
+
+        /**
+         * Called when returning user signs in (popup closes immediately with google_profile)
+         * and backend confirms their subscription.
+         * @param {string} email
+         * @param {string} name
+         * @param {string} provider
+         */
+        async handleReturningUser(email, name, provider) {
+            AppState.userEmail    = email;
+            AppState.userName     = name;
+            AppState.userProvider = provider;
+            localStorage.setItem("fa_user_email",    email);
+            localStorage.setItem("fa_user_name",     name);
+            localStorage.setItem("fa_user_provider", provider);
+
+            ViewRouter.show("Loading");
+            try {
+                const result = await ApiService.checkSubscription(email);
+                const userPlan = result.plan || (result.user && result.user.plan);
+                if (result.hasSubscription || userPlan) {
+                    AppState.hasSubscription  = true;
+                    AppState.subscriptionId   = result.subscriptionId || AppState.subscriptionId;
+                    AppState.subscriptionPlan = userPlan              || AppState.subscriptionPlan;
+                    this._persistSubscription();
+                    DashboardService.render();
+                    ViewRouter.show("Dashboard");
+                } else {
+                    // Plan is null or missing — show subscription page
+                    ViewRouter.show("Plans");
+                }
+            } catch {
+                ViewRouter.show("Plans");
+            }
+        },
+
+        /**
+         * Opens a Google OAuth popup.
+         * The popup now hosts the entire Plans → Payment → Success flow.
+         * - For new users:      popup sends  { type: 'google_authed', email, name, subscriptionId, plan }
+         * - For returning users (if future backend check skips popup): sends { type: 'google_profile', ... }
+         * - On logout click:    popup sends  { type: 'google_cancelled' }
+         */
+        openGooglePopup() {
+            const googleAuthUrl = "http://localhost:8000/api/auth/google/connect";
+
+            const msgHandler = (event) => {
+                if (!event.data) return;
+                let data = event.data;
+                if (typeof data === "string") {
+                    try { data = JSON.parse(data); } catch (_) {}
+                }
+
+                if (!data || !data.type) return;
+
+                if (data.type === "google_authed") {
+                    // New user completed payment inside popup
+                    window.removeEventListener("message", msgHandler);
+                    AuthService.handleNewUserAuthed(
+                        data.email || "",
+                        data.name  || data.email || "",
+                        "google",
+                        data.subscriptionId || "",
+                        data.plan           || "Starter"
+                    );
+                } else if (data.type === "google_profile") {
+                    // Returning user — popup closed immediately, check backend
+                    window.removeEventListener("message", msgHandler);
+                    AuthService.handleReturningUser(
+                        data.email || "",
+                        data.name  || data.email || "",
+                        "google"
+                    );
+                } else if (data.type === "google_cancelled") {
+                    // User clicked logout in the popup
+                    window.removeEventListener("message", msgHandler);
+                    ViewRouter.show("Welcome");
+                }
+            };
+            window.addEventListener("message", msgHandler);
+
+            const popup = window.open(
+                googleAuthUrl, "fa_google_auth",
+                "width=640,height=840,top=40,left=80,toolbar=no,menubar=no"
+            );
+
+            if (!popup || popup.closed) {
+                window.removeEventListener("message", msgHandler);
+                DashboardService.showError("Popup was blocked. Please allow popups and try again.");
+            }
+        },
+
+        /**
+         * Opens a mock Microsoft OAuth flow.
+         * In production, replace with real Microsoft MSAL / OAuth URL.
+         */
+        openMicrosoftPopup() {
+            const mockMSUrl = "http://localhost:8000/api/microsoft/connect";
+
+            const msgHandler = (event) => {
+                if (!event.data) return;
+                let data = event.data;
+                if (typeof data === "string") {
+                    try { data = JSON.parse(data); } catch (_) {}
+                }
+                if (!data || !data.type) return;
+
+                if (data.type === "microsoft_authed" || data.type === "ms_authed") {
+                    window.removeEventListener("message", msgHandler);
+                    AuthService.handleNewUserAuthed(
+                        data.email || "",
+                        data.name  || data.email || "",
+                        "microsoft",
+                        data.subscriptionId || "",
+                        data.plan           || "Starter"
+                    );
+                } else if (data.type === "ms_profile" || data.type === "microsoft_profile") {
+                    window.removeEventListener("message", msgHandler);
+                    AuthService.handleReturningUser(
+                        data.email || "",
+                        data.name  || data.email || "",
+                        "microsoft"
+                    );
+                } else if (data.type === "ms_cancelled" || data.type === "google_cancelled") {
+                    window.removeEventListener("message", msgHandler);
+                    ViewRouter.show("Welcome");
+                }
+            };
+            window.addEventListener("message", msgHandler);
+
+            const popup = window.open(
+                mockMSUrl, "fa_ms_auth",
+                "width=640,height=800,top=60,left=80,toolbar=no,menubar=no"
+            );
+
+            if (!popup || popup.closed) {
+                window.removeEventListener("message", msgHandler);
+                DashboardService.showError("Popup was blocked. Please allow popups and try again.");
+            }
+        },
+
+        _persistSubscription() {
+            localStorage.setItem("fa_has_subscription",  String(AppState.hasSubscription));
+            localStorage.setItem("fa_subscription_id",   AppState.subscriptionId   || "");
+            const _planToSave = (AppState.subscriptionPlan && AppState.subscriptionPlan !== 'null' && AppState.subscriptionPlan !== 'undefined') ? AppState.subscriptionPlan : "";
+            localStorage.setItem("fa_subscription_plan", _planToSave);
+        },
+
+        /**
+         * Clears all auth + subscription state and returns to welcome screen.
+         */
+        logout() {
+            ExcelService.clearMasterData().catch(err => console.error("Error clearing Excel data on logout: ", err));
+            AppState.userEmail        = null;
+            AppState.userName         = null;
+            AppState.userProvider     = null;
+            AppState.hasSubscription  = false;
+            AppState.subscriptionId   = null;
+            AppState.subscriptionPlan = null;
+            AppState.erpConnected     = false;
+            AppState.erpType          = null;
+            AppState.erpOrgName       = null;
+            AppState.erpConnectedDate = null;
+
+            [
+                "fa_user_email", "fa_user_name", "fa_user_provider",
+                "fa_has_subscription", "fa_subscription_id", "fa_subscription_plan",
+                "fa_erp_connected", "fa_erp_type", "fa_erp_org", "fa_erp_date", "fa_last_view"
+            ].forEach(k => localStorage.removeItem(k));
+
+            try {
+                fetch("http://localhost:8000/api/auth/logout", { method: "POST" }).catch(() => {});
+            } catch (_) {}
+
+            ViewRouter.show("Welcome");
+        }
+    };
+
+    // ============================================================
+    // 6. CHECKOUT / PAYMENT SERVICE
+    // ============================================================
+    const CheckoutService = {
+        /**
+         * Initiates the mock hosted checkout flow.
+         * In production: replace mock URL with Stripe/Razorpay checkout session URL.
+         */
+        openCheckout(plan, price, cycle) {
+            AppState.pendingPlan  = plan;
+            AppState.pendingPrice = price;
+            AppState.pendingCycle = cycle;
+
+            const checkoutUrl = `http://localhost:8000/api/payments/checkout?plan=${encodeURIComponent(plan)}&price=${price}&cycle=${encodeURIComponent(cycle)}&email=${encodeURIComponent(AppState.userEmail || "")}`;
+
+            const btnText    = document.getElementById("checkoutBtnText");
+            const btnSpinner = document.getElementById("checkoutSpinner");
+            if (btnText)    btnText.textContent = "Opening Secure Checkout...";
+            if (btnSpinner) btnSpinner.classList.remove("hidden");
+
+            const msgHandler = (event) => {
+                if (!event.data) return;
+                let data = event.data;
+                if (typeof data === "string") {
+                    try { data = JSON.parse(data); } catch (_) {}
+                }
+                if (data && (data.type === "payment_success" || data.type === "checkout_complete")) {
+                    window.removeEventListener("message", msgHandler);
+                    CheckoutService.handlePaymentSuccess(data);
+                }
+            };
+            window.addEventListener("message", msgHandler);
+
+            const popup = window.open(
+                checkoutUrl, "fa_checkout",
+                "width=540,height=700,top=60,left=80,toolbar=no,menubar=no"
+            );
+
+            if (btnText)    btnText.textContent = "Open Secure Checkout";
+            if (btnSpinner) btnSpinner.classList.add("hidden");
+
+            if (!popup || popup.closed) {
+                window.removeEventListener("message", msgHandler);
+                DashboardService.showError("Checkout popup was blocked. Please allow popups.");
+            }
+        },
+
+        /**
+         * Handles successful payment message from checkout popup.
+         * In production, backend verifies and returns subscription details.
+         */
+        handlePaymentSuccess(data) {
+            const subId = data.subscriptionId || ("FA-SUB-" + Math.floor(100000 + Math.random() * 900000));
+            const plan  = data.plan           || AppState.pendingPlan  || "Professional";
+
+            AppState.hasSubscription  = true;
+            AppState.subscriptionId   = subId;
+            AppState.subscriptionPlan = plan;
+            AuthService._persistSubscription();
+
+            // Show success screen
+            const idEl   = document.getElementById("successSubId");
+            const planEl = document.getElementById("successPlanName");
+            if (idEl)   idEl.textContent   = subId;
+            if (planEl) planEl.textContent  = plan;
+
+            ViewRouter.show("Success");
+        },
+
+        /**
+         * Manually verifies a payment when user clicks "Verify my payment".
+         * In production: calls GET /api/payments/verify?email=...
+         */
+        async verifyPayment() {
+            ViewRouter.show("Loading");
+            try {
+                const res    = await ApiService.checkSubscription(AppState.userEmail);
+                if (res.hasSubscription) {
+                    AppState.hasSubscription  = true;
+                    AppState.subscriptionId   = res.subscriptionId || AppState.subscriptionId;
+                    AppState.subscriptionPlan = res.plan           || AppState.pendingPlan;
+                    AuthService._persistSubscription();
+
+                    const idEl   = document.getElementById("successSubId");
+                    const planEl = document.getElementById("successPlanName");
+                    if (idEl)   idEl.textContent   = AppState.subscriptionId;
+                    if (planEl) planEl.textContent  = AppState.subscriptionPlan;
+                    ViewRouter.show("Success");
+                } else {
+                    ViewRouter.show("Payment");
+                }
+            } catch {
+                ViewRouter.show("Payment");
+            }
+        }
+    };
+
+    // ============================================================
+    // 7. DASHBOARD SERVICE
+    // ============================================================
+    // ============================================================
+    // 7. DASHBOARD SERVICE
+    // ============================================================
+    const DashboardService = {
+        /**
+         * Renders and populates all dashboard UI elements based on AppState.
+         */
+        render() {
+            const name  = AppState.userName  || AppState.userEmail || "User";
+            const first = name.split(" ")[0];
+            const initial = name.charAt(0).toUpperCase();
+
+            // Set avatar initials
+            const avatars = ["dashHeaderAvatarBtn1", "dashHeaderAvatarBtn2", "dashHeaderAvatarBtn3", "dropdownAvatar", "blockAvatar"];
+            avatars.forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.textContent = initial;
+            });
+
+            // Render details in disconnected state header
+            const welcomeEl = document.getElementById("dashWelcome");
+            const badgeEl   = document.getElementById("dashPlanBadge");
+            const subIdEl   = document.getElementById("dashSubId");
+
+            if (welcomeEl) welcomeEl.textContent = `Welcome, ${first}!`;
+            if (badgeEl)   badgeEl.textContent = ((AppState.subscriptionPlan && AppState.subscriptionPlan !== 'null' ? AppState.subscriptionPlan : "Basic") + " Plan");
+            if (subIdEl)   subIdEl.textContent = AppState.subscriptionId || "—";
+            
+            // Render details in dropdown and blocks
+            if (document.getElementById("dropdownUserName")) document.getElementById("dropdownUserName").textContent = name;
+            if (document.getElementById("dropdownUserEmail")) document.getElementById("dropdownUserEmail").textContent = AppState.userEmail;
+            if (document.getElementById("blockUserName")) document.getElementById("blockUserName").textContent = name;
+            if (document.getElementById("blockUserEmail")) document.getElementById("blockUserEmail").textContent = AppState.userEmail;
+            
+            if (document.getElementById("blockSubId")) document.getElementById("blockSubId").textContent = AppState.subscriptionId || "—";
+            const _safePlan = (AppState.subscriptionPlan && AppState.subscriptionPlan !== 'null') ? AppState.subscriptionPlan : "Basic";
+            if (document.getElementById("blockPlanName")) document.getElementById("blockPlanName").textContent = _safePlan + " Plan";
+            if (document.getElementById("blockPlanTitle")) document.getElementById("blockPlanTitle").textContent = _safePlan + " Plan";
+            if (document.getElementById("blockPlanType")) document.getElementById("blockPlanType").textContent = _safePlan + " Plan";
+
+            // Render correct state sections
+            this.renderERPSection();
+
+            // Set connected values if connected
+            if (AppState.erpConnected && AppState.erpType) {
+                AppState.currentProvider = AppState.erpType;
+                this.renderERPConsole();
+            }
+        },
+
+        /**
+         * Shows the provider-selected "not connected" state (Image 4).
+         * Called when user clicks QuickBooks or Xero card from the connect screen.
+         * @param {"quickbooks"|"xero"} provider
+         */
+        showProviderSelected(provider) {
+            AppState.currentProvider = provider;
+            const isQB  = provider === "quickbooks";
+            const pName = isQB ? "QuickBooks" : "Xero";
+
+            // Hide disconnected + connected, show provider-selected
+            const discSection = document.getElementById("dashDisconnected");
+            const provSection = document.getElementById("dashProviderSelected");
+            const connSection = document.getElementById("dashConnected");
+            const connectingSection = document.getElementById("dashConnecting");
+            if (discSection) discSection.style.display = "none";
+            if (provSection) provSection.style.display = "flex";
+            if (connSection) connSection.style.display = "none";
+            if (connectingSection) connectingSection.style.display = "none";
+
+            // Update the plan badge
+            const planBadge = document.getElementById("providerPlanBadge");
+            if (planBadge) {
+                planBadge.textContent = isQB ? "QBO PRO" : "XERO PRO";
+            }
+
+            // Update the connect button
+            const connectBtn = document.getElementById("btnConnectProvider");
+            if (connectBtn) connectBtn.textContent = `Connect ${pName}`;
+
+            // Update pull button label
+            const pullLabel = document.getElementById("pullBtnProvLabel");
+            if (pullLabel) pullLabel.textContent = isQB ? "QBO" : "Xero";
+
+            // Update progress step labels
+            const step1Label = document.getElementById("provStep1Label");
+            const step3Label = document.getElementById("provStep3Label");
+            if (step1Label) step1Label.textContent = `Connect to ${pName}`;
+            if (step3Label) step3Label.textContent = `Pull Master Data`;
+        },
+
+        showConnecting(provider) {
+            AppState.currentProvider = provider;
+            const pName = provider === "quickbooks" ? "QuickBooks" : "Xero";
+
+            const discSection = document.getElementById("dashDisconnected");
+            const provSection = document.getElementById("dashProviderSelected");
+            const connSection = document.getElementById("dashConnected");
+            const connectingSection = document.getElementById("dashConnecting");
+
+            if (discSection) discSection.style.display = "none";
+            if (provSection) provSection.style.display = "none";
+            if (connSection) connSection.style.display = "none";
+            if (connectingSection) {
+                connectingSection.style.display = "flex";
+                const textEl = document.getElementById("connectingText");
+                if (textEl) textEl.textContent = `Connecting with ${pName}...`;
+            }
+        },
+
+        /**
+         * Shows the correct ERP section based on state:
+         * - disconnected: connect cards (Image 2)
+         * - provider-selected: not connected (Image 4)
+         * - connected: fully connected (Image 3)
+         */
+        renderERPSection() {
+            const discSection = document.getElementById("dashDisconnected");
+            const provSection = document.getElementById("dashProviderSelected");
+            const connSection = document.getElementById("dashConnected");
+            const connectingSection = document.getElementById("dashConnecting");
+
+            fetch("http://localhost:8000/api/connections?mail=" + encodeURIComponent(AppState.userEmail || ""))
+                .then(r => r.json())
+                .then(conns => {
+                    const dropdown = document.getElementById("companySelectDropdown");
+                    const companyListEl = document.getElementById("companyList");
+                    const footerEl = document.getElementById("companyListFooter");
+                    const modalListEl = document.getElementById("modalCompanyList");
+
+                    const activeConns = conns.filter(c => c.status !== 'Disconnected');
+                    if (activeConns.length > 0) {
+                        AppState.forceWelcome = false;
+                    }
+                    if (!conns || conns.length === 0 || AppState.forceWelcome) {
+                        AppState.erpConnected = false;
+                        if (discSection) {
+                            discSection.style.display = "flex";
+                            discSection.style.flexDirection = "column";
+                            discSection.style.height = "100%";
+                        }
+                        if (provSection) provSection.style.display = "none";
+                        if (connSection) connSection.style.display = "none";
+                        if (connectingSection) connectingSection.style.display = "none";
+
+                        // Update QB card button label
+                        const hasQB   = (conns || []).some(c => (c.platform || "").toLowerCase() === "quickbooks");
+                        const hasXero = (conns || []).some(c => (c.platform || "").toLowerCase() === "xero");
+                        const qbBtn   = document.querySelector("#btnConnectQB .btn-connect-full");
+                        const xeroBtn = document.querySelector("#btnConnectXero .btn-connect-full");
+                        if (qbBtn)   qbBtn.innerHTML   = hasQB   ? "▶ Open QuickBooks Dashboard →" : `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg> Connect QuickBooks →`;
+                        if (xeroBtn) xeroBtn.innerHTML = hasXero ? "▶ Open Xero Dashboard →"       : `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg> Connect Xero →`;
+
+                        return;
+                    }
+
+                    // We have connections!
+                    AppState.erpConnected = true;
+                    if (discSection) discSection.style.display = "none";
+                    if (provSection) provSection.style.display = "none";
+                    if (connSection) connSection.style.display = "flex";
+                    if (connectingSection) connectingSection.style.display = "none";
+
+                    // Determine the current platform first (respect AppState.currentProvider if already set)
+                    let resolvedProvider = AppState.currentProvider || null;
+                    if (!resolvedProvider) {
+                        // Derive from the currently tracked companyId if possible
+                        const existingConn = activeConns.find(c => c.companyId === AppState.currentCompanyId) || conns.find(c => c.companyId === AppState.currentCompanyId) || conns[0];
+                        resolvedProvider = existingConn ? (existingConn.platform || "quickbooks").toLowerCase() : "quickbooks";
+                    }
+                    AppState.currentProvider = resolvedProvider;
+                    AppState.erpType = resolvedProvider;
+
+                    // Get active connections scoped to the current platform
+                    const platformActiveConns = activeConns.filter(c => (c.platform || "quickbooks").toLowerCase() === resolvedProvider);
+                    const fallbackConns = platformActiveConns.length > 0 ? platformActiveConns : conns.filter(c => (c.platform || "quickbooks").toLowerCase() === resolvedProvider);
+
+                    // Ensure current active company ID is valid for this platform
+                    const isCurrentValid = AppState.currentCompanyId && platformActiveConns.some(ac => ac.companyId === AppState.currentCompanyId);
+                    if (!isCurrentValid && fallbackConns.length > 0) {
+                        AppState.currentCompanyId = fallbackConns[0].companyId;
+                        // Update provider if we fell back to a different platform
+                        const fb = fallbackConns[0];
+                        AppState.currentProvider = (fb.platform || "quickbooks").toLowerCase();
+                        AppState.erpType = AppState.currentProvider;
+                    }
+
+                    // Determine provider
+                    const isXero = (AppState.currentProvider || "quickbooks").toLowerCase() === "xero";
+
+                    // Handle Section Visibility (Xero Multi-select vs QB Single Active Company)
+                    const selectXeroCard = document.getElementById("selectXeroCompaniesCard");
+                    const activeCompanyCard = document.getElementById("activeCompanyCard");
+
+                    if (isXero) {
+                        if (selectXeroCard) selectXeroCard.style.display = "block";
+                        if (activeCompanyCard) activeCompanyCard.style.display = "none";
+
+                        // Populate Xero Multi-Select Checklist Card
+                        const currentPlan = (AppState.subscriptionPlan && AppState.subscriptionPlan !== 'null') ? AppState.subscriptionPlan : "Basic";
+                        const maxAllowed = currentPlan === "Basic" ? 1 : (currentPlan === "Standard" ? 3 : 10);
+                        const xeroConns = conns.filter(c => (c.platform || "").toLowerCase() === "xero");
+                        
+                        let xeroSelected = new Set(xeroConns.filter(c => c.status !== 'Disconnected').map(c => c.companyId));
+
+                        const listEl = document.getElementById("xeroCompanyList");
+                        const selCountEl = document.getElementById("xeroSelCount");
+                        const maxCountEl = document.getElementById("xeroMaxCount");
+                        const maxAllowedEl = document.getElementById("xeroMaxAllowed");
+                        const planBadgeEl = document.getElementById("xeroPlanBadge");
+                        const warningEl = document.getElementById("xeroLimitWarning");
+                        const confirmBtn = document.getElementById("btnConfirmXeroCompanies");
+
+                        if (maxCountEl) maxCountEl.textContent = maxAllowed;
+                        if (maxAllowedEl) maxAllowedEl.textContent = maxAllowed;
+                        if (planBadgeEl) planBadgeEl.textContent = `${currentPlan.toUpperCase()} (${maxAllowed}) PLAN`;
+
+                        const updateXeroUI = () => {
+                            if (selCountEl) selCountEl.textContent = xeroSelected.size;
+                            if (confirmBtn) confirmBtn.disabled = xeroSelected.size === 0;
+                            if (warningEl) warningEl.style.display = xeroSelected.size >= maxAllowed ? "inline" : "none";
+                        };
+
+                        if (listEl) {
+                            listEl.innerHTML = "";
+                            xeroConns.forEach(c => {
+                                const isChecked = xeroSelected.has(c.companyId);
+                                const row = document.createElement("div");
+                                row.className = `xero-company-row ${isChecked ? "selected" : ""}`;
+                                row.id = "xero_row_" + c.companyId;
+                                row.innerHTML = `
+                                    <input type="checkbox" class="xero-company-cb" id="xero_cb_${c.companyId}" value="${c.companyId}" ${isChecked ? "checked" : ""} />
+                                    <div class="xero-company-icon">xero</div>
+                                    <div class="xero-company-info">
+                                        <div class="xero-company-name">${c.companyName || "Xero Organisation"}</div>
+                                        <div class="xero-company-id">Realm: ${c.companyId || "—"}</div>
+                                    </div>
+                                `;
+
+                                const cb = row.querySelector(".xero-company-cb");
+
+                                row.addEventListener("click", (e) => {
+                                    if (e.target === cb) return;
+                                    if (cb.checked) {
+                                        cb.checked = false;
+                                    } else {
+                                        if (xeroSelected.size >= maxAllowed && !xeroSelected.has(c.companyId)) return;
+                                        cb.checked = true;
+                                    }
+                                    cb.dispatchEvent(new Event("change"));
+                                });
+
+                                cb.addEventListener("change", () => {
+                                    if (cb.checked) {
+                                        if (xeroSelected.size >= maxAllowed) {
+                                            cb.checked = false;
+                                            return;
+                                        }
+                                        xeroSelected.add(c.companyId);
+                                        row.classList.add("selected");
+                                    } else {
+                                        xeroSelected.delete(c.companyId);
+                                        row.classList.remove("selected");
+                                    }
+                                    updateXeroUI();
+                                });
+
+                                listEl.appendChild(row);
+                            });
+                        }
+                        updateXeroUI();
+
+                        if (confirmBtn) {
+                            const newConfirmBtn = confirmBtn.cloneNode(true);
+                            confirmBtn.parentNode.replaceChild(newConfirmBtn, confirmBtn);
+
+                            newConfirmBtn.addEventListener("click", async () => {
+                                if (xeroSelected.size === 0) return;
+                                newConfirmBtn.disabled = true;
+                                newConfirmBtn.innerHTML = '<span class="spinner" style="display:inline-block;width:12px;height:12px;border:2px solid rgba(255,255,255,0.4);border-top-color:#fff;border-radius:50%;animation:spin 0.7s linear infinite;margin-right:6px;vertical-align:middle;"></span> Saving...';
+
+                                try {
+                                    for (const c of xeroConns) {
+                                        if (xeroSelected.has(c.companyId)) {
+                                            await fetch(`http://localhost:8000/api/connections/${c.companyId}/activate`, { method: "POST" });
+                                        } else {
+                                            await fetch(`http://localhost:8000/api/connections/${c.companyId}`, { method: "DELETE" });
+                                        }
+                                    }
+
+                                    const activeId = Array.from(xeroSelected)[0];
+                                    if (activeId) AppState.currentCompanyId = activeId;
+
+                                    DashboardService.showStatus("Xero companies saved successfully.", "success");
+                                    DashboardService.renderERPSection();
+                                } catch (err) {
+                                    console.error("Error saving Xero companies:", err);
+                                    DashboardService.showStatus("Failed to save Xero companies.", "error");
+                                    newConfirmBtn.disabled = false;
+                                    newConfirmBtn.textContent = "Connect Selected Companies";
+                                }
+                            });
+                        }
+                    } else {
+                        if (selectXeroCard) selectXeroCard.style.display = "none";
+                        if (activeCompanyCard) activeCompanyCard.style.display = "block";
+                    }
+
+                    // Populate Active Company Dropdown (platform-filtered)
+                    if (dropdown) {
+                        dropdown.innerHTML = "";
+                        const platformDropdownConns = activeConns.filter(c => (c.platform || "quickbooks").toLowerCase() === (AppState.currentProvider || "quickbooks"));
+                        platformDropdownConns.forEach(c => {
+                            const opt = document.createElement("option");
+                            opt.value = c.companyId;
+                            opt.dataset.platform = (c.platform || "QuickBooks").toLowerCase();
+                            opt.textContent = `${c.companyName || "Company"}`;
+                            if (c.companyId === AppState.currentCompanyId) opt.selected = true;
+                            dropdown.appendChild(opt);
+                        });
+                    }
+
+                    // Set active company details
+                    const activeConn = activeConns.find(c => c.companyId === AppState.currentCompanyId) || activeConns[0];
+                    if (activeConn) {
+                        AppState.currentCompanyId = activeConn.companyId;
+                        AppState.currentProvider = (activeConn.platform || "quickbooks").toLowerCase();
+                        AppState.erpType = AppState.currentProvider;
+
+                        const activeRealmEl = document.getElementById("activeRealmId");
+                        if (activeRealmEl) activeRealmEl.textContent = activeConn.companyId || "—";
+                        const realmEl = document.getElementById("connRealmId");
+                        if (realmEl) realmEl.textContent = activeConn.companyId || "—";
+                    }
+
+                    // Platform-scoped connections (only show same platform as current active company)
+                    const currentPlatform = AppState.currentProvider || "quickbooks";
+                    const platformConns = conns.filter(c => (c.platform || "quickbooks").toLowerCase() === currentPlatform);
+
+                    // Populate Company Management List (platform-filtered)
+                    if (companyListEl) {
+                        companyListEl.innerHTML = "";
+                        platformConns.forEach(c => {
+                            const isActive = c.companyId === AppState.currentCompanyId;
+                            const isXero = (c.platform || "").toLowerCase() === "xero";
+                            const isDisconnected = c.status === 'Disconnected';
+                            const item = document.createElement("div");
+                            item.className = `fa-company-item ${isActive ? "active-company" : ""} ${isDisconnected ? "disconnected-company" : ""}`;
+                            item.dataset.companyId = c.companyId;
+                            
+                            let badgeOrBtn = "";
+                            if (isActive && !isDisconnected) {
+                                badgeOrBtn = '<span class="fa-badge-active">ACTIVE</span>';
+                            } else if (isDisconnected) {
+                                badgeOrBtn = '<button class="fa-btn-reconnect">Reconnect</button>';
+                            } else {
+                                badgeOrBtn = '<button class="fa-btn-switch">Switch</button>';
+                            }
+
+                            item.innerHTML = `
+                                <input type="radio" name="companyRadio" class="fa-company-radio" ${isActive && !isDisconnected ? "checked" : ""} />
+                                <div class="fa-company-icon ${isXero ? 'xero-company-icon' : ''}">${isXero ? 'xero' : 'qb'}</div>
+                                <div class="fa-company-info">
+                                    <div class="fa-company-name">${c.companyName || (isXero ? "Xero Organisation" : "QuickBooks Company")}</div>
+                                    <div class="fa-company-tag">Last Sync: ${this.formatRelativeTime(c.lastSyncedAt, c.status)}</div>
+                                </div>
+                                <div class="fa-company-actions">
+                                    ${badgeOrBtn}
+                                    <button class="fa-btn-dots" title="More options">⋮</button>
+                                </div>
+                            `;
+
+                            // Click radio or card row to make active
+                            item.addEventListener("click", (e) => {
+                                if (e.target.classList.contains("fa-btn-dots")) {
+                                    e.stopPropagation();
+                                    this.showContextMenu(e.target, c);
+                                    return;
+                                }
+                                if (e.target.classList.contains("fa-btn-reconnect")) {
+                                    e.stopPropagation();
+                                    this.showStatus("Launching re-authorization...", "success");
+                                    this.launchERPOAuth((c.platform || "quickbooks").toLowerCase());
+                                    return;
+                                }
+                                this.switchActiveCompany(c.companyId, platformConns);
+                            });
+
+                            companyListEl.appendChild(item);
+                        });
+                    }
+
+                    if (footerEl) {
+                        const platformLabel = currentPlatform === "xero" ? "Xero" : "QuickBooks";
+                        footerEl.textContent = `Showing ${platformConns.length} ${platformLabel} ${platformConns.length === 1 ? "company" : "companies"}`;
+                    }
+
+                    // Populate Subscription Stats (filtered by current active platform: quickbooks or xero)
+                    const currentPlan = (AppState.subscriptionPlan && AppState.subscriptionPlan !== 'null') ? AppState.subscriptionPlan : "Basic";
+                    const maxAllowed = currentPlan === "Basic" ? 1 : (currentPlan === "Standard" ? 3 : 10);
+                    
+                    const connectedCount = platformConns.length;
+                    const remaining = Math.max(0, maxAllowed - connectedCount);
+
+                    if (document.getElementById("subInfoPlan")) document.getElementById("subInfoPlan").textContent = currentPlan;
+                    if (document.getElementById("subInfoConnected")) document.getElementById("subInfoConnected").textContent = `${connectedCount} / ${maxAllowed}`;
+                    if (document.getElementById("subInfoRemaining")) document.getElementById("subInfoRemaining").textContent = String(remaining);
+
+                    // Update Tier Badge in Header
+                    const tierBadge = document.getElementById("connTierBadge");
+                    if (tierBadge) tierBadge.textContent = `${currentPlan.toUpperCase()} PLAN`;
+
+                    // Update dynamic button label for Pull Master Data
+                    const isQB = AppState.currentProvider === "quickbooks";
+                    const platformDisplayName = isQB ? "QuickBooks" : "Xero";
+                    const pullLabel = document.getElementById("pullBtnLabel");
+                    if (pullLabel) pullLabel.textContent = isQB ? "QBO" : "Xero";
+
+                    // Update "Company Management" section title to reflect platform
+                    const sectionTitle = document.querySelector(".fa-section-title");
+                    if (sectionTitle) sectionTitle.textContent = `${platformDisplayName} Companies`;
+
+                    // Update header status realm label
+                    const connStatus = document.querySelector(".fa-conn-status");
+                    if (connStatus && activeConn) {
+                        connStatus.innerHTML = `Connected – ${platformDisplayName}: <span id="connRealmId">${activeConn.companyId || "—"}</span>`;
+                    }
+
+                    // Update Disconnect button label
+                    const disconnectBtn = document.getElementById("btnDisconnectERP");
+                    if (disconnectBtn) disconnectBtn.textContent = `Disconnect ${platformDisplayName}`;
+
+                    // Show console for correct provider
+                    const qbConsole   = document.getElementById("qbConsole");
+                    const xeroConsole = document.getElementById("xeroConsole");
+                    if (qbConsole)   qbConsole.style.display   = isQB ? "flex" : "none";
+                    if (xeroConsole) xeroConsole.style.display  = isQB ? "none" : "flex";
+                })
+                .catch(() => {
+                    // Fallback to offline/disconnected view
+                    if (discSection) {
+                        discSection.style.display = "flex";
+                        discSection.style.flexDirection = "column";
+                        discSection.style.height = "100%";
+                    }
+                    if (provSection) provSection.style.display = "none";
+                    if (connSection) connSection.style.display = "none";
+                    if (connectingSection) connectingSection.style.display = "none";
+                });
+        },
+
+        formatRelativeTime(dateInput, status) {
+            if (status === 'Disconnected') return "Disconnected";
+            if (!dateInput) return "Not synced yet";
+            const date = new Date(dateInput);
+            if (isNaN(date.getTime())) return "Not synced yet";
+            const now = new Date();
+            const diffMs = now - date;
+            if (diffMs < 0) return "Just now";
+            const diffSec = Math.floor(diffMs / 1000);
+            if (diffSec < 45) return "Just now";
+            const diffMin = Math.floor(diffSec / 60);
+            if (diffMin < 60) {
+                return diffMin === 1 ? "1 minute ago" : `${diffMin} minutes ago`;
+            }
+            const diffHr = Math.floor(diffMin / 60);
+            if (diffHr < 24) {
+                return diffHr === 1 ? "1 hour ago" : `${diffHr} hours ago`;
+            }
+            const diffDays = Math.floor(diffHr / 24);
+            if (diffDays < 30) {
+                return diffDays === 1 ? "1 day ago" : `${diffDays} days ago`;
+            }
+            return date.toLocaleDateString();
+        },
+
+        switchActiveCompany(companyId, conns) {
+            AppState.currentCompanyId = companyId;
+
+            // Set the provider immediately from the target company so renderERPSection shows correct platform
+            const targetConn = conns.find(c => c.companyId === companyId);
+            if (targetConn) {
+                AppState.currentProvider = (targetConn.platform || "quickbooks").toLowerCase();
+                AppState.erpType = AppState.currentProvider;
+            }
+
+            ExcelService.clearMasterData().catch(err => console.error("Error clearing Excel data: ", err));
+            
+            fetch(`http://localhost:8000/api/connections/${companyId}/activate`, { method: "POST" })
+                .then(() => {
+                    this.renderERPSection();
+                })
+                .catch(err => {
+                    console.error("Error activating company:", err);
+                    this.renderERPSection();
+                });
+
+            if (targetConn) {
+                this.addLog(`Switched active company to: ${targetConn.companyName}`);
+                this.showStatus(`Active company updated to ${targetConn.companyName}`, "success");
+            }
+        },
+
+        showContextMenu(targetBtn, company) {
+            const menu = document.getElementById("companyContextMenu");
+            if (!menu) return;
+            const rect = targetBtn.getBoundingClientRect();
+            menu.style.top = `${rect.bottom + 4}px`;
+            menu.style.left = `${rect.left - 100}px`;
+            menu.style.display = "block";
+
+            const editBtn = document.getElementById("ctxEdit");
+            const disconnectBtn = document.getElementById("ctxDisconnect");
+
+            if (editBtn) {
+                editBtn.onclick = () => {
+                    menu.style.display = "none";
+                    this.showRenameModal(company);
+                };
+            }
+            if (disconnectBtn) {
+                disconnectBtn.onclick = async () => {
+                    menu.style.display = "none";
+                    this.showStatus(`Disconnecting ${company.companyName}...`, "success");
+                    try {
+                        await fetch(`http://localhost:8000/api/connections/${company.companyId}`, { method: "DELETE" });
+                        // If we disconnected the currently active company, reset it so a new one is picked
+                        if (AppState.currentCompanyId === company.companyId) {
+                            AppState.currentCompanyId = null;
+                        }
+                        this.showStatus("Company disconnected.", "success");
+                        this.renderERPSection();
+                    } catch (_) {
+                        this.showStatus("Failed to disconnect company.", "error");
+                    }
+                };
+            }
+        },
+
+        showRenameModal(company) {
+            const modal = document.getElementById("renameCompanyModal");
+            const input = document.getElementById("renameCompanyInput");
+            const closeBtn = document.getElementById("btnCloseRenameCompany");
+            const cancelBtn = document.getElementById("btnCancelRenameCompany");
+            const confirmBtn = document.getElementById("btnConfirmRenameCompany");
+
+            if (!modal || !input) return;
+            input.value = company.companyName || "";
+            modal.style.display = "flex";
+            input.focus();
+
+            const closeModal = () => {
+                modal.style.display = "none";
+            };
+
+            if (closeBtn) closeBtn.onclick = closeModal;
+            if (cancelBtn) cancelBtn.onclick = closeModal;
+
+            if (confirmBtn) {
+                confirmBtn.onclick = async () => {
+                    const newName = input.value.trim();
+                    if (!newName) return;
+                    confirmBtn.disabled = true;
+                    try {
+                        const res = await fetch(`http://localhost:8000/api/connections/${company.companyId}/rename`, {
+                            method: "PATCH",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ companyName: newName })
+                        });
+                        if (res.ok) {
+                            company.companyName = newName;
+                            this.showStatus("Company renamed successfully.", "success");
+                            closeModal();
+                            this.renderERPSection();
+                        } else {
+                            this.showStatus("Failed to rename company.", "error");
+                        }
+                    } catch (err) {
+                        console.error("Rename error:", err);
+                        this.showStatus("Failed to rename company.", "error");
+                    } finally {
+                        confirmBtn.disabled = false;
+                    }
+                };
+            }
+        },
+
+        /**
+         * Updates the progress step markers for the ERP console.
+         */
+        renderERPConsole() {
+            const stepId = AppState.erpType === "quickbooks" ? "stepConnect" : "xeroStepConnect";
+            const stepEl = document.getElementById(stepId);
+            if (stepEl) stepEl.classList.add("complete");
+        },
+
+        /**
+         * Adds a log line to the active ERP console.
+         * @param {string} message
+         */
+        addLog(message) {
+            const logId = AppState.currentProvider === "quickbooks" ? "qbLog" : "xeroLog";
+            const log   = document.getElementById(logId);
+            if (!log) return;
+            const line = document.createElement("div");
+            line.className = "log-line";
+            line.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            log.appendChild(line);
+            log.scrollTop = log.scrollHeight;
+        },
+
+        /**
+         * Displays a status notification in the dashboard status bar.
+         * @param {string} message
+         * @param {"success"|"error"} type
+         */
+        showStatus(message, type) {
+            const bar = AppState.erpConnected ? document.getElementById("statusBarConnected") : document.getElementById("statusBar");
+            if (!bar) return;
+            bar.innerHTML    = message;
+            bar.className    = "status-bar";
+            bar.classList.add(type === "success" ? "status-success" : "status-error");
+        },
+
+        /**
+         * Marks a progress step as complete.
+         * @param {string} step - base step ID
+         */
+        completeStep(step) {
+            let id = step;
+            if (AppState.currentProvider !== "quickbooks") {
+                if (step === "stepConnect") id = "xeroStepConnect";
+                if (step === "stepSetup")   id = "xeroStepSetup";
+                if (step === "stepPull")    id = "xeroStepPull";
+            }
+            const el = document.getElementById(id);
+            if (el) el.classList.add("complete");
+        },
+
+        resetSteps() {
+            ["stepConnect","stepSetup","stepPull","xeroStepConnect","xeroStepSetup","xeroStepPull"]
+                .forEach(id => document.getElementById(id)?.classList.remove("complete", "active"));
+        },
+
+        /**
+         * Shows the error view with a given message.
+         * @param {string} message
+         */
+        showError(message) {
+            const msgEl = document.getElementById("errorMessage");
+            if (msgEl) msgEl.textContent = message;
+            ViewRouter.show("Error");
+        },
+
+        /**
+         * Launches the ERP OAuth popup for the given provider.
+         * @param {"quickbooks"|"xero"} provider
+         */
+        launchERPOAuth(provider) {
+            this.showConnecting(provider);
+            AppState.currentProvider = provider;
+            const isQB  = provider === "quickbooks";
+            const pName = isQB ? "QuickBooks" : "Xero";
+            const encodedMail = encodeURIComponent(AppState.userEmail || "");
+            const connectUrl = isQB
+                ? `http://localhost:8000/api/quickbooks/connect/?tier=${AppState.currentTier}&mail=${encodedMail}`
+                : `http://localhost:8000/api/xero/connect?tier=${AppState.currentTier}&mail=${encodedMail}`;
+
+            this.addLog(`Opening ${pName} sign-in...`);
+            this.showStatus(`Opening ${pName} sign-in...`, "success");
+
+            // Note: The simulated setTimeout was removed so the UI waits for the real OAuth callback.
+
+
+            if (typeof Office !== "undefined" && Office.context && Office.context.ui) {
+                Office.context.ui.displayDialogAsync(
+                    connectUrl,
+                    { height: 60, width: 45, displayInIframe: false, promptBeforeOpen: true },
+                    (asyncResult) => {
+                        if (asyncResult.status === Office.AsyncResultStatus.Failed) {
+                            const win = window.open(connectUrl, "_blank", "width=800,height=600");
+                            if (!win) {
+                                this.showStatus(`Unable to open ${pName} sign-in. Allow popups.`, "error");
+                            } else {
+                                const timer = setInterval(() => {
+                                    if (win.closed) {
+                                        clearInterval(timer);
+                                        DashboardService.onERPConnected(provider);
+                                    }
+                                }, 1000);
+                            }
+                        } else {
+                            const dialog = asyncResult.value;
+                            dialog.addEventHandler(Office.EventType.DialogMessageReceived, (arg) => {
+                                if (arg.message === "qb_connected" || arg.message === "xero_connected") {
+                                    dialog.close();
+                                    DashboardService.onERPConnected(provider);
+                                }
+                            });
+                            // Fallback: If user closes dialog manually, simulate connection success
+                            dialog.addEventHandler(Office.EventType.DialogEventReceived, (arg) => {
+                                if (arg.error === 12006) {
+                                    DashboardService.onERPConnected(provider);
+                                }
+                            });
+                        }
+                    }
+                );
+            } else {
+                // Standard popup (browser context)
+                const msgHandler = (event) => {
+                    if (event.data === "qb_connected" || event.data === "xero_connected") {
+                        window.removeEventListener("message", msgHandler);
+                        DashboardService.onERPConnected(provider);
+                    }
+                };
+                window.addEventListener("message", msgHandler);
+
+                const win = window.open(connectUrl, `${provider}_auth`, "width=800,height=600");
+                if (!win) {
+                    this.showStatus(`Unable to open ${pName} sign-in. Allow popups.`, "error");
+                } else {
+                    // Fallback: Check if window is closed manually
+                    const timer = setInterval(() => {
+                        if (win.closed) {
+                            clearInterval(timer);
+                            window.removeEventListener("message", msgHandler);
+                            DashboardService.onERPConnected(provider);
+                        }
+                    }, 1000);
+                }
+            }
+        },
+
+        /**
+         * Handles successful ERP OAuth callback — saves state and refreshes dashboard.
+         * @param {"quickbooks"|"xero"} provider
+         */
+        onERPConnected(provider) {
+            const isQB = provider === "quickbooks";
+            const now  = new Date().toLocaleDateString("en-IN", { day: "numeric", month: "long", year: "numeric" });
+
+            AppState.erpConnected     = true;
+            AppState.erpType          = provider;
+            AppState.erpConnectedDate = now;
+            AppState.currentProvider  = provider;
+
+            localStorage.setItem("fa_erp_connected", "true");
+            localStorage.setItem("fa_erp_type",      provider);
+            localStorage.setItem("fa_erp_date",      now);
+
+            // Attempt to fetch org name from backend
+            const tokenUrl = isQB
+                ? "http://localhost:8000/api/quickbooks/tokens/"
+                : "http://localhost:8000/api/xero/tokens";
+
+            fetch(tokenUrl)
+                .then(r => r.json())
+                .then(data => {
+                    const tokens = data.tokens || [];
+                    const realmId = tokens[0]?.realm_id || tokens[0]?.tenant_name || null;
+                    // Use backend realm_id if available, else generate a random 16-digit ID
+                    const connId = realmId || DashboardService._generateConnectionId();
+                    AppState.erpOrgName   = connId;
+                    AppState.connectionId = connId;
+                    localStorage.setItem("fa_erp_org", connId);
+                    DashboardService._finalizeConnection(provider, connId);
+                })
+                .catch(() => {
+                    // Backend not available — generate a random connection ID
+                    const connId = DashboardService._generateConnectionId();
+                    AppState.erpOrgName   = connId;
+                    AppState.connectionId = connId;
+                    localStorage.setItem("fa_erp_org", connId);
+                    DashboardService._finalizeConnection(provider, connId);
+                });
+        },
+
+        /**
+         * Generates a random 16-digit numeric connection/realm ID.
+         * @returns {string}
+         */
+        _generateConnectionId() {
+            // Generate 16-digit number similar to QuickBooks realm IDs
+            const part1 = Math.floor(1000000000 + Math.random() * 9000000000); // 10 digits
+            const part2 = Math.floor(100000 + Math.random() * 900000);          // 6 digits
+            return String(part1) + String(part2);
+        },
+
+        /**
+         * Finalises connection: marks step 1 complete, renders connected dashboard, updates ID.
+         * @param {string} provider
+         * @param {string} connId
+         */
+        _finalizeConnection(provider, connId) {
+            const isQB = provider === "quickbooks";
+
+            // Mark step 1 (Connect) complete in provider-selected console
+            document.getElementById("provStepConnect")?.classList.add("complete");
+
+            // Transition to fully connected dashboard (Image 3)
+            this.render();
+
+            // Explicitly set the realm ID text in connected header
+            const realmEl = document.getElementById("connRealmId");
+            if (realmEl) realmEl.textContent = connId;
+
+            // Show success status
+            this.showStatus(`${isQB ? "QuickBooks" : "Xero"} connected successfully.`, "success");
+            this.completeStep("stepConnect");
+        },
+
+        /**
+         * Disconnects the ERP provider — clears state but keeps FinAccrual subscription.
+         */
+        async disconnectERP() {
+            // Optimistically update AppState
+            AppState.erpConnected     = false;
+            AppState.erpType          = null;
+            AppState.erpOrgName       = null;
+            AppState.erpConnectedDate = null;
+            AppState.isConnected      = false;
+            AppState.connectionId     = null;
+            AppState.currentCompanyId = null;
+            AppState.forceWelcome     = true;
+
+            localStorage.removeItem("fa_erp_connected");
+            localStorage.removeItem("fa_erp_type");
+            localStorage.removeItem("fa_erp_org");
+            localStorage.removeItem("fa_erp_date");
+
+            this.resetSteps();
+            // Also reset provider-selected progress steps
+            ["provStepConnect","provStepSetup","provStepPull"]
+                .forEach(id => document.getElementById(id)?.classList.remove("complete", "active"));
+            
+            // Clear logs
+            const qbLog = document.getElementById("qbLog");
+            const xeroLog = document.getElementById("xeroLog");
+            if (qbLog) qbLog.innerHTML = "";
+            if (xeroLog) xeroLog.innerHTML = "";
+
+            this.showStatus("Disconnecting all companies...", "success");
+
+            // Disconnect ALL companies for this user from the backend
+            try {
+                const mail = AppState.userEmail || "";
+                const connsRes = await fetch(`http://localhost:8000/api/connections?mail=${encodeURIComponent(mail)}`);
+                const conns = await connsRes.json();
+                const activeConns = (conns || []).filter(c => c.status !== 'Disconnected');
+                await Promise.all(activeConns.map(c =>
+                    fetch(`http://localhost:8000/api/connections/${c.companyId}`, { method: "DELETE" }).catch(() => {})
+                ));
+            } catch (_) {}
+
+            try { await ExcelService.clearMasterData(); } catch (_) {}
+
+            // Now re-render — all companies should be Disconnected, so it shows the disconnected view
+            this.renderERPSection();
+            this.showStatus("ERP disconnected. Your FinAccrual account is still active.", "success");
+        }
+    };
+
+    // ============================================================
+    // 8. MAIN APP CONTROLLER — EVENT BINDING & INIT
+    // ============================================================
+    const AppController = {
+
+        init() {
+            this.bindWelcomeView();
+            this.bindPlansView();
+            this.bindPaymentView();
+            this.bindSuccessView();
+            this.bindDashboardView();
+            this.bindErrorView();
+            this.restoreSession();
+        },
+
+        // ---- Welcome View ----
+        bindWelcomeView() {
+            document.getElementById("btnSignInGoogle")?.addEventListener("click", () => {
+                const btn = document.getElementById("btnSignInGoogle");
+                if (btn) btn.disabled = true;
+                AuthService.openGooglePopup();
+                setTimeout(() => { if (btn) btn.disabled = false; }, 3000);
+            });
+
+            document.getElementById("btnSignInMicrosoft")?.addEventListener("click", () => {
+                const btn = document.getElementById("btnSignInMicrosoft");
+                if (btn) btn.disabled = true;
+                AuthService.openMicrosoftPopup();
+                setTimeout(() => { if (btn) btn.disabled = false; }, 3000);
+            });
+        },
+
+        // ---- Plans View ----
+        bindPlansView() {
+            const toggle     = document.getElementById("billingCycleToggle");
+            const monthLabel = document.getElementById("labelMonthly");
+            const yearLabel  = document.getElementById("labelYearly");
+
+            const updatePrices = (isYearly) => {
+                document.querySelectorAll("[data-monthly][data-yearly]").forEach(btn => {
+                    const monthly = parseInt(btn.dataset.monthly);
+                    const yearly  = parseInt(btn.dataset.yearly);
+                    let amountId = "proAmount";
+                    if (btn.id === "btnSelectBasic") amountId = "basicAmount";
+                    else if (btn.id === "btnSelectStandard") amountId = "standardAmount";
+                    
+                    const el = document.getElementById(amountId);
+                    if (el) el.textContent = isYearly ? yearly : monthly;
+
+                    btn.dataset.activePrice = String(isYearly ? yearly : monthly);
+                    btn.dataset.activeCycle = isYearly ? "Yearly" : "Monthly";
+                });
+                if (monthLabel) monthLabel.classList.toggle("active-label", !isYearly);
+                if (yearLabel)  yearLabel.classList.toggle("active-label",  isYearly);
+            };
+
+            // Initialize labels
+            if (monthLabel) monthLabel.classList.add("active-label");
+
+            if (toggle) {
+                toggle.addEventListener("change", () => updatePrices(toggle.checked));
+            }
+
+            // Plan select buttons
+            document.querySelectorAll("[data-plan]").forEach(btn => {
+                btn.addEventListener("click", () => {
+                    const plan  = btn.dataset.plan;
+                    const cycle = btn.dataset.activeCycle || "Monthly";
+                    const price = btn.dataset.activePrice || btn.dataset.monthly || "Custom";
+
+                    if (plan === "Enterprise") {
+                        DashboardService.showStatus("Enterprise enquiry sent! Our sales team will contact you.", "success");
+                        return;
+                    }
+
+                    // Populate payment view
+                    const payPlanEl  = document.getElementById("paymentPlanName");
+                    const payCycleEl = document.getElementById("paymentBillingCycle");
+                    const payTotalEl = document.getElementById("paymentTotal");
+                    if (payPlanEl)  payPlanEl.textContent  = plan;
+                    if (payCycleEl) payCycleEl.textContent = cycle;
+                    if (payTotalEl) payTotalEl.textContent = `₹${price}`;
+
+                    AppState.pendingPlan  = plan;
+                    AppState.pendingPrice = price;
+                    AppState.pendingCycle = cycle;
+
+                    ViewRouter.show("Payment");
+                });
+            });
+
+            // Back button
+            document.getElementById("btnPlansBack")?.addEventListener("click", () => {
+                if (AppState.hasSubscription) {
+                    ViewRouter.show("Dashboard");
+                } else {
+                    ViewRouter.show("Welcome");
+                }
+            });
+        },
+
+        // ---- Payment View ----
+        bindPaymentView() {
+            document.getElementById("btnPaymentBack")?.addEventListener("click", () => {
+                ViewRouter.show("Plans");
+            });
+
+            document.getElementById("btnOpenCheckout")?.addEventListener("click", () => {
+                CheckoutService.openCheckout(
+                    AppState.pendingPlan,
+                    AppState.pendingPrice,
+                    AppState.pendingCycle
+                );
+            });
+
+            document.getElementById("btnVerifyPayment")?.addEventListener("click", (e) => {
+                e.preventDefault();
+                CheckoutService.verifyPayment();
+            });
+        },
+
+        // ---- Success View ----
+        bindSuccessView() {
+            document.getElementById("btnGotoDashboard")?.addEventListener("click", () => {
+                DashboardService.render();
+                ViewRouter.show("Dashboard");
+            });
+        },
+
+        // ---- Dashboard View ----
+        bindDashboardView() {
+            // Logouts
+            const handleLogout = (e) => {
+                if (e) e.preventDefault();
+                AuthService.logout();
+            };
+            document.getElementById("btnBlockLogout")?.addEventListener("click", handleLogout);
+            document.getElementById("btnDropdownLogout")?.addEventListener("click", handleLogout);
+            document.getElementById("btnChangePlan")?.addEventListener("click", () => {
+                ExcelService.clearMasterData().catch(err => console.error("Error clearing Excel data: ", err));
+                ViewRouter.show("Plans");
+            });
+
+            // Copy Subscription ID handler
+            const handleCopySubId = () => {
+                const subIdText = document.getElementById("dashSubId")?.textContent?.trim() || AppState.subscriptionId;
+                if (subIdText) {
+                    navigator.clipboard.writeText(subIdText).then(() => {
+                        const btn = document.getElementById("btnCopySubId");
+                        if (btn) {
+                            const originalHTML = btn.innerHTML;
+                            btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>`;
+                            setTimeout(() => {
+                                btn.innerHTML = originalHTML;
+                            }, 1800);
+                        }
+                    }).catch(err => {
+                        console.error("Copy failed: ", err);
+                    });
+                }
+            };
+            document.getElementById("btnCopySubId")?.addEventListener("click", handleCopySubId);
+            
+            // Dropdown Toggle
+            const toggleDropdown = (e) => {
+                e.stopPropagation();
+                const dropdown = document.getElementById("accountMenuDropdown");
+                if (dropdown) {
+                    dropdown.style.display = dropdown.style.display === "none" ? "flex" : "none";
+                }
+            };
+            document.getElementById("dashHeaderAvatarBtn1")?.addEventListener("click", toggleDropdown);
+            document.getElementById("dashHeaderAvatarBtn2")?.addEventListener("click", toggleDropdown);
+            document.getElementById("dashHeaderAvatarBtn3")?.addEventListener("click", toggleDropdown);
+            document.getElementById("dashHeaderMenuBtn1")?.addEventListener("click", toggleDropdown);
+
+            // Hide dropdown when clicking outside
+            document.addEventListener("click", (e) => {
+                const dropdown = document.getElementById("accountMenuDropdown");
+                if (dropdown && !dropdown.contains(e.target)) {
+                    dropdown.style.display = "none";
+                }
+            });
+
+            // Menu item to show block
+            document.querySelectorAll(".dropdown-menu-item").forEach(item => {
+                if (item.id === "btnDropdownLogout") return;
+                item.addEventListener("click", (e) => {
+                    const targetId = e.currentTarget.dataset.target;
+                    document.querySelectorAll(".detail-block-card").forEach(c => c.style.display = "none");
+                    const targetBlock = document.getElementById(targetId);
+                    if (targetBlock) {
+                        targetBlock.style.display = "block";
+                    }
+                    const container = document.getElementById("detailBlocksContainer");
+                    if (container) {
+                        container.style.display = "flex";
+                    }
+                    const dropdown = document.getElementById("accountMenuDropdown");
+                    if (dropdown) dropdown.style.display = "none";
+                });
+            });
+
+            // Close block buttons
+            document.querySelectorAll(".close-block-btn, .close-card-btn").forEach(btn => {
+                btn.addEventListener("click", (e) => {
+                    const card = e.target.closest(".detail-block-card");
+                    if (card) card.style.display = "none";
+                    const container = document.getElementById("detailBlocksContainer");
+                    if (container) {
+                        const anyVisible = Array.from(container.querySelectorAll(".detail-block-card")).some(c => c.style.display !== "none");
+                        if (!anyVisible) {
+                            container.style.display = "none";
+                        }
+                    }
+                });
+            });
+
+            // Close blocks on backdrop click
+            const blocksContainer = document.getElementById("detailBlocksContainer");
+            if (blocksContainer) {
+                blocksContainer.addEventListener("click", (e) => {
+                    if (e.target === blocksContainer) {
+                        document.querySelectorAll(".detail-block-card").forEach(c => c.style.display = "none");
+                        blocksContainer.style.display = "none";
+                    }
+                });
+            }
+            
+            // Allow user to cancel connection attempt and go back to disconnected state
+            document.getElementById("btnLogoutProvider")?.addEventListener("click", () => {
+                DashboardService.renderERPSection();
+            });
+
+            // Connect QuickBooks — check if accounts already exist in DB first
+            document.getElementById("btnConnectQB")?.addEventListener("click", async () => {
+                try {
+                    const mail = AppState.userEmail || "";
+                    const res = await fetch(`http://localhost:8000/api/connections?mail=${encodeURIComponent(mail)}`);
+                    const allConns = await res.json();
+                    const qbConns = (allConns || []).filter(c => (c.platform || "").toLowerCase() === "quickbooks");
+                    if (qbConns.length > 0) {
+                        // Existing QB accounts found — reactivate the first active one (or first overall)
+                        const toActivate = qbConns.find(c => c.status !== 'Disconnected') || qbConns[0];
+                        AppState.currentCompanyId = toActivate.companyId;
+                        AppState.currentProvider = "quickbooks";
+                        AppState.erpType = "quickbooks";
+                        await fetch(`http://localhost:8000/api/connections/${toActivate.companyId}/activate`, { method: "POST" });
+                        DashboardService.renderERPSection();
+                        DashboardService.showStatus(`Resumed QuickBooks session for ${toActivate.companyName}`, "success");
+                        return;
+                    }
+                } catch (_) {}
+                // No existing accounts — start OAuth
+                DashboardService.showProviderSelected("quickbooks");
+                DashboardService.launchERPOAuth("quickbooks");
+            });
+
+            // Connect Xero — check if accounts already exist in DB first
+            document.getElementById("btnConnectXero")?.addEventListener("click", async () => {
+                try {
+                    const mail = AppState.userEmail || "";
+                    const res = await fetch(`http://localhost:8000/api/connections?mail=${encodeURIComponent(mail)}`);
+                    const allConns = await res.json();
+                    const xeroConns = (allConns || []).filter(c => (c.platform || "").toLowerCase() === "xero");
+                    if (xeroConns.length > 0) {
+                        // Existing Xero accounts found — reactivate the first one
+                        const toActivate = xeroConns.find(c => c.status !== 'Disconnected') || xeroConns[0];
+                        AppState.currentCompanyId = toActivate.companyId;
+                        AppState.currentProvider = "xero";
+                        AppState.erpType = "xero";
+                        await fetch(`http://localhost:8000/api/connections/${toActivate.companyId}/activate`, { method: "POST" });
+                        DashboardService.renderERPSection();
+                        DashboardService.showStatus(`Resumed Xero session for ${toActivate.companyName}`, "success");
+                        return;
+                    }
+                } catch (_) {}
+                // No existing accounts — start OAuth
+                DashboardService.showProviderSelected("xero");
+                DashboardService.launchERPOAuth("xero");
+            });
+
+            // Connect Provider button in provider-selected state — launches OAuth
+            document.getElementById("btnConnectProvider")?.addEventListener("click", () => {
+                DashboardService.launchERPOAuth(AppState.currentProvider);
+            });
+
+            // Disconnect ERP (overall disconnect)
+            document.getElementById("btnDisconnectERP")?.addEventListener("click", async () => {
+                await DashboardService.disconnectERP();
+            });
+
+            // Sub card Change Plan button
+            document.getElementById("btnSubChangePlan")?.addEventListener("click", () => {
+                ExcelService.clearMasterData().catch(err => console.error("Error clearing Excel data: ", err));
+                ViewRouter.show("Plans");
+            });
+
+            // Add Company buttons (checks plan limits before starting OAuth)
+            // Uses the currently active ERP provider so that:
+            //   - Xero dashboard  → opens Xero OAuth
+            //   - QuickBooks dashboard → opens QuickBooks OAuth
+            const handleAddCompanyClick = () => {
+                ExcelService.clearMasterData().catch(err => console.error("Error clearing Excel data: ", err));
+                const currentPlan = (AppState.subscriptionPlan && AppState.subscriptionPlan !== 'null') ? AppState.subscriptionPlan : "Basic";
+                const maxAllowed = currentPlan === "Basic" ? 1 : (currentPlan === "Standard" ? 3 : 10);
+                // Derive the provider from the active dashboard, fall back to quickbooks
+                const provider = AppState.currentProvider || "quickbooks";
+                
+                console.log("handleAddCompanyClick: provider = " + provider + ", AppState.currentProvider = " + AppState.currentProvider);
+
+                fetch("http://localhost:8000/api/connections?mail=" + encodeURIComponent(AppState.userEmail || ""))
+                    .then(r => r.json())
+                    .then(conns => {
+                        const connsForProvider = (conns || []).filter(c => 
+                            (c.platform || "").toLowerCase() === provider.toLowerCase()
+                        );
+                        if (connsForProvider.length >= maxAllowed) {
+                            alert(`Your ${currentPlan} Plan limits active ${provider === 'quickbooks' ? 'QuickBooks' : 'Xero'} connections to ${maxAllowed} companies. Please upgrade your plan to connect more companies.`);
+                            ViewRouter.show("Plans");
+                        } else {
+                            DashboardService.showProviderSelected(provider);
+                            DashboardService.launchERPOAuth(provider);
+                        }
+                    })
+                    .catch(() => {
+                        DashboardService.launchERPOAuth(provider);
+                    });
+            };
+            document.getElementById("btnAddCompany")?.addEventListener("click", handleAddCompanyClick);
+            document.getElementById("btnModalAddCompany")?.addEventListener("click", () => {
+                const modal = document.getElementById("changeCompanyModal");
+                if (modal) modal.style.display = "none";
+                handleAddCompanyClick();
+            });
+
+            // Change Company Modal open/close & switch logic
+            let selectedModalCompanyId = null;
+            const openChangeCompanyModal = () => {
+                const modal = document.getElementById("changeCompanyModal");
+                const modalList = document.getElementById("modalCompanyList");
+                if (!modal || !modalList) return;
+
+                fetch("http://localhost:8000/api/connections?mail=" + encodeURIComponent(AppState.userEmail || ""))
+                    .then(r => r.json())
+                    .then(conns => {
+                        modalList.innerHTML = "";
+                        // Filter to show only companies for the current platform
+                        const currentPlatform = AppState.currentProvider || "quickbooks";
+                        const platformConns = conns.filter(c => (c.platform || "quickbooks").toLowerCase() === currentPlatform);
+                        const platformLabel = currentPlatform === "xero" ? "Xero" : "QuickBooks";
+
+                        // Update modal title
+                        const modalTitle = document.querySelector("#changeCompanyModal .fa-modal-title, #changeCompanyModal h3");
+                        if (modalTitle) modalTitle.textContent = `Switch ${platformLabel} Company`;
+
+                        platformConns.forEach(c => {
+                            const isSelected = c.companyId === (selectedModalCompanyId || AppState.currentCompanyId);
+                            const isXero = (c.platform || "").toLowerCase() === "xero";
+                            const isDisconnected = c.status === 'Disconnected';
+                            const row = document.createElement("div");
+                            row.className = `fa-modal-company-row ${isSelected ? "selected" : ""} ${isDisconnected ? "disconnected" : ""}`;
+                            row.dataset.companyId = c.companyId;
+                            row.dataset.platform = (c.platform || "quickbooks").toLowerCase();
+                            
+                            const displayName = c.companyName || (isXero ? "Xero Organisation" : "QuickBooks Company");
+
+                            row.innerHTML = `
+                                <div class="fa-company-icon ${isXero ? 'xero-company-icon' : ''}">${isXero ? 'xero' : 'qb'}</div>
+                                <div class="fa-company-info">
+                                    <div class="fa-company-name">${displayName}${isDisconnected ? ' <span style="color:#ef4444;font-size:10px">(Disconnected)</span>' : ''}</div>
+                                    <div class="fa-company-tag">Realm ID: ${c.companyId || "—"}</div>
+                                </div>
+                            `;
+                            row.addEventListener("click", () => {
+                                modalList.querySelectorAll(".fa-modal-company-row").forEach(r => r.classList.remove("selected"));
+                                row.classList.add("selected");
+                                selectedModalCompanyId = c.companyId;
+                            });
+                            modalList.appendChild(row);
+                        });
+                        modal.style.display = "flex";
+                    });
+            };
+
+            document.getElementById("btnChangeCompany")?.addEventListener("click", openChangeCompanyModal);
+            document.getElementById("btnManageCompanies")?.addEventListener("click", openChangeCompanyModal);
+
+            const closeChangeCompanyModal = () => {
+                const modal = document.getElementById("changeCompanyModal");
+                if (modal) modal.style.display = "none";
+            };
+            document.getElementById("btnCloseChangeCompany")?.addEventListener("click", closeChangeCompanyModal);
+            document.getElementById("btnCancelChangeCompany")?.addEventListener("click", closeChangeCompanyModal);
+
+            document.getElementById("btnConfirmChangeCompany")?.addEventListener("click", async () => {
+                if (selectedModalCompanyId) {
+                    AppState.currentCompanyId = selectedModalCompanyId;
+                    // Determine the platform from the selected modal row
+                    const selectedRow = document.querySelector(`.fa-modal-company-row[data-company-id="${selectedModalCompanyId}"]`);
+                    if (selectedRow && selectedRow.dataset.platform) {
+                        AppState.currentProvider = selectedRow.dataset.platform;
+                        AppState.erpType = selectedRow.dataset.platform;
+                    }
+                    ExcelService.clearMasterData().catch(err => console.error("Error clearing Excel data: ", err));
+                    try {
+                        await fetch(`http://localhost:8000/api/connections/${selectedModalCompanyId}/activate`, { method: "POST" });
+                    } catch (_) {}
+                    DashboardService.renderERPSection();
+                    DashboardService.showStatus("Active company switched successfully.", "success");
+                }
+                closeChangeCompanyModal();
+            });
+
+            // Modal search filter
+            document.getElementById("companySearchInput")?.addEventListener("input", (e) => {
+                const term = e.target.value.toLowerCase();
+                document.querySelectorAll(".fa-modal-company-row").forEach(row => {
+                    const text = row.textContent.toLowerCase();
+                    row.style.display = text.includes(term) ? "flex" : "none";
+                });
+            });
+
+            // Close context menu when clicking anywhere else
+            document.addEventListener("click", (e) => {
+                const menu = document.getElementById("companyContextMenu");
+                if (menu && !menu.contains(e.target) && !e.target.classList.contains("fa-btn-dots")) {
+                    menu.style.display = "none";
+                }
+            });
+
+            // Disconnect Active Company
+            document.getElementById("btnDisconnectActiveCompany")?.addEventListener("click", async () => {
+                const companyId = AppState.currentCompanyId;
+                if (!companyId) return;
+                
+                DashboardService.showStatus("Disconnecting company...", "success");
+                try {
+                    const res = await fetch(`http://localhost:8000/api/connections/${companyId}`, {
+                        method: "DELETE"
+                    });
+                    if (res.ok) {
+                        AppState.currentCompanyId = null; // Reset so a new active company gets picked
+                        DashboardService.showStatus("Company disconnected successfully.", "success");
+                        DashboardService.renderERPSection();
+                    } else {
+                        DashboardService.showStatus("Failed to disconnect company.", "error");
+                    }
+                } catch (err) {
+                    DashboardService.showStatus("Error disconnecting company.", "error");
+                }
+            });
+
+            // Dropdown selection change
+            document.getElementById("companySelectDropdown")?.addEventListener("change", (e) => {
+                const dropdown = e.target;
+                const opt = dropdown.options[dropdown.selectedIndex];
+                if (opt) {
+                    AppState.currentCompanyId = opt.value;
+                    AppState.currentProvider = opt.dataset.platform;
+                    AppState.erpType = opt.dataset.platform;
+                    ExcelService.clearMasterData().catch(err => console.error("Error clearing Excel data: ", err));
+
+                    // Activate in backend and re-render
+                    fetch(`http://localhost:8000/api/connections/${opt.value}/activate`, { method: "POST" })
+                        .then(() => DashboardService.renderERPSection())
+                        .catch(() => DashboardService.renderERPSection());
+
+                    DashboardService.addLog(`Switched active company to: ${opt.textContent}`);
+                }
+            });
+
+            // Setup Sheets button in provider-selected state
+            document.getElementById("setupBtnProv")?.addEventListener("click", async () => {
+                try {
+                    document.getElementById("provStepSetup")?.classList.add("active");
+                    DashboardService.addLog(`Setting up Master & Input sheets for ${AppState.currentProvider === "quickbooks" ? "QuickBooks" : "Xero"}...`);
+                    DashboardService.showStatus("Setting up sheets...", "success");
+                    await ExcelService.setupWorkbookSheets(AppState.currentProvider);
+                    document.getElementById("provStepSetup")?.classList.add("complete");
+                    DashboardService.addLog("Sheets setup successfully.");
+                    DashboardService.showStatus("Master and Input sheets setup successfully.", "success");
+                } catch (error) {
+                    console.error(error);
+                    DashboardService.addLog("Error setting up sheets: " + error.message);
+                    DashboardService.showStatus("Error setting up sheets.", "error");
+                }
+            });
+
+            // Pull Data button in provider-selected state
+            document.getElementById("pullBtnProv")?.addEventListener("click", async () => {
+                try {
+                    document.getElementById("provStepPull")?.classList.add("active");
+                    DashboardService.addLog(`Pulling master data from ${AppState.currentProvider === "quickbooks" ? "QuickBooks" : "Xero"}...`);
+                    DashboardService.showStatus("Pulling data...", "success");
+                    const data = await ApiService.fetchMasterData(AppState.currentProvider, AppState.currentCompanyId);
+                    await ExcelService.writeMasterData(AppState.currentProvider, data);
+                    document.getElementById("provStepPull")?.classList.add("complete");
+                    DashboardService.addLog("Master data imported successfully.");
+                    DashboardService.showStatus("Master data imported successfully.", "success");
+                    DashboardService.renderERPSection();
+                } catch (error) {
+                    console.error(error);
+                    DashboardService.addLog("Error pulling data: " + error.message);
+                    DashboardService.showStatus("Error pulling data.", "error");
+                }
+            });
+
+            // Journal type buttons in provider-selected state
+            document.querySelectorAll("#dashProviderSelected .conn-journal-btn").forEach(btn => {
+                btn.addEventListener("click", () => {
+                    document.querySelectorAll("#dashProviderSelected .conn-journal-btn").forEach(b => b.classList.remove("active"));
+                    btn.classList.add("active");
+                });
+            });
+
+            // Setup Sheets button
+            document.getElementById("setupBtn")?.addEventListener("click", async () => {
+                try {
+                    const stepSetupId = AppState.currentProvider === "quickbooks" ? "stepSetup" : "xeroStepSetup";
+                    document.getElementById(stepSetupId)?.classList.add("active");
+
+                    DashboardService.addLog(`Setting up Master & Input sheets for ${AppState.currentProvider === "quickbooks" ? "QuickBooks" : "Xero"}...`);
+                    DashboardService.showStatus("Setting up sheets...", "success");
+                    await ExcelService.setupWorkbookSheets(AppState.currentProvider);
+                    DashboardService.completeStep("stepSetup");
+                    DashboardService.addLog("Sheets setup successfully.");
+                    DashboardService.showStatus("Master and Input sheets setup successfully.", "success");
+                } catch (error) {
+                    console.error(error);
+                    DashboardService.addLog("Error setting up sheets: " + error.message);
+                    DashboardService.showStatus("Error setting up sheets.", "error");
+                }
+            });
+
+            // Pull Data button
+            document.getElementById("pullBtn")?.addEventListener("click", async () => {
+                try {
+                    const stepPullId = AppState.currentProvider === "quickbooks" ? "stepPull" : "xeroStepPull";
+                    document.getElementById(stepPullId)?.classList.add("active");
+
+                    DashboardService.addLog(`Pulling master data from ${AppState.currentProvider === "quickbooks" ? "QuickBooks" : "Xero"}...`);
+                    DashboardService.showStatus("Pulling data...", "success");
+                    const data = await ApiService.fetchMasterData(AppState.currentProvider, AppState.currentCompanyId);
+                    await ExcelService.writeMasterData(AppState.currentProvider, data);
+                    DashboardService.completeStep("stepPull");
+                    DashboardService.addLog("Master data imported successfully.");
+                    DashboardService.showStatus("Master data imported successfully.", "success");
+                    DashboardService.renderERPSection();
+                } catch (error) {
+                    console.error(error);
+                    DashboardService.addLog("Error pulling data: " + error.message);
+                    DashboardService.showStatus("Error pulling data.", "error");
+                }
+            });
+
+            // Journal type buttons
+            document.querySelectorAll(".conn-journal-btn").forEach(btn => {
+                btn.addEventListener("click", () => {
+                    document.querySelectorAll(".conn-journal-btn").forEach(b => b.classList.remove("active"));
+                    btn.classList.add("active");
+                });
+            });
+
+            // Provider Tab Toggles
+            const tabQB   = document.getElementById("tabQB");
+            const tabXero = document.getElementById("tabXero");
+            const options = document.getElementById("connTierOptions");
+
+            const toggleOptions = (provider) => {
+                if (options) {
+                    options.style.display = options.style.display === "flex" ? "none" : "flex";
+                    options.style.flexDirection = "column";
+                    
+                    // Render correct options list
+                    const isQB = provider === "quickbooks";
+                    document.getElementById("tierBasic").textContent = isQB ? "Q Basic" : "Xero Basic";
+                    document.getElementById("tierStandard").textContent = isQB ? "Q Standard" : "Xero Standard";
+                    document.getElementById("tierPro").textContent = isQB ? "Q Pro" : "Xero Pro";
+                }
+            };
+
+            tabQB?.addEventListener("click", (e) => {
+                e.stopPropagation();
+                if (AppState.erpConnected && AppState.erpType !== "quickbooks") return; // Tab locked to connection
+                toggleOptions("quickbooks");
+            });
+
+            tabXero?.addEventListener("click", (e) => {
+                e.stopPropagation();
+                if (AppState.erpConnected && AppState.erpType !== "xero") return; // Tab locked to connection
+                toggleOptions("xero");
+            });
+
+            // Dropdown option clicks
+            document.querySelectorAll(".conn-tier-opt").forEach(opt => {
+                opt.addEventListener("click", (e) => {
+                    e.stopPropagation();
+                    document.querySelectorAll(".conn-tier-opt").forEach(o => o.classList.remove("selected"));
+                    opt.classList.add("selected");
+                    
+                    const tierName = opt.textContent;
+                    AppState.erpTier = tierName;
+                    const badge = document.getElementById("connTierBadge");
+                    if (badge) badge.textContent = tierName;
+
+                    if (options) options.style.display = "none";
+                });
+            });
+
+            // Collapse dropdown on outside click
+            document.addEventListener("click", () => {
+                if (options) options.style.display = "none";
+            });
+
+            // Refresh Schedule buttons
+            const handleRefreshClick = async (event) => {
+                const button = event.currentTarget;
+                const isProv = button.id === "btnRefreshScheduleProv";
+                
+                // Verify that both setup and pull steps are complete first
+                let isSetupComplete = false;
+                let isPullComplete = false;
+                
+                if (isProv) {
+                    isSetupComplete = document.getElementById("provStepSetup")?.classList.contains("complete");
+                    isPullComplete = document.getElementById("provStepPull")?.classList.contains("complete");
+                } else {
+                    const stepSetupId = AppState.currentProvider === "quickbooks" ? "stepSetup" : "xeroStepSetup";
+                    const stepPullId = AppState.currentProvider === "quickbooks" ? "stepPull" : "xeroStepPull";
+                    isSetupComplete = document.getElementById(stepSetupId)?.classList.contains("complete");
+                    isPullComplete = document.getElementById(stepPullId)?.classList.contains("complete");
+                }
+
+                if (!isSetupComplete || !isPullComplete) {
+                    DashboardService.addLog("Cannot refresh: Setup and initial Pull must be completed first.");
+                    DashboardService.showStatus("Please set up master sheet and pull data first.", "error");
+                    return;
+                }
+
+                const icon = button.querySelector(".refresh-icon");
+                if (icon) icon.classList.add("spin");
+                
+                try {
+                    DashboardService.addLog(`Refreshing live data from ${AppState.currentProvider === "quickbooks" ? "QuickBooks" : "Xero"}...`);
+                    DashboardService.showStatus("Refreshing...", "success");
+                    
+                    const data = await ApiService.fetchMasterData(AppState.currentProvider, AppState.currentCompanyId);
+                    await ExcelService.writeMasterData(AppState.currentProvider, data);
+                    
+                    const timestamp = new Date().toLocaleTimeString();
+                    await ExcelService.stampLastRefreshed(timestamp);
+                    
+                    DashboardService.addLog("Live data refreshed and timestamp stamped successfully.");
+                    DashboardService.showStatus("Updated successfully.", "success");
+                } catch (err) {
+                    console.error("Refresh error:", err);
+                    DashboardService.addLog("Error refreshing: " + err.message);
+                    DashboardService.showStatus("Error refreshing: " + err.message, "error");
+                } finally {
+                    setTimeout(() => {
+                        if (icon) icon.classList.remove("spin");
+                    }, 1000);
+                }
+            };
+
+            document.getElementById("btnRefreshScheduleProv")?.addEventListener("click", handleRefreshClick);
+            document.getElementById("btnRefreshSchedule")?.addEventListener("click", handleRefreshClick);
+        },
+
+        // ---- Error View ----
+        bindErrorView() {
+            document.getElementById("btnRetry")?.addEventListener("click", () => {
+                ViewRouter.show("Welcome");
+            });
+        },
+
+        // ---- Session Restoration ----
+        /**
+         * On load, checks localStorage to see if the user already has an active session.
+         * If so, skips the welcome screen and navigates straight to the dashboard.
+         */
+        restoreSession() {
+            const email = localStorage.getItem("fa_user_email");
+            if (email) {
+                AppState.userEmail = email;
+                AppState.userName = localStorage.getItem("fa_user_name");
+                AppState.userProvider = localStorage.getItem("fa_user_provider");
+                AppState.hasSubscription = localStorage.getItem("fa_has_subscription") === "true";
+                AppState.subscriptionId = localStorage.getItem("fa_subscription_id");
+                AppState.subscriptionPlan = (v => (!v || v === 'null' || v === 'undefined') ? null : v)(localStorage.getItem("fa_subscription_plan"));
+                AppState.erpConnected = localStorage.getItem("fa_erp_connected") === "true";
+                AppState.erpType = localStorage.getItem("fa_erp_type");
+                
+                DashboardService.render();
+
+                const lastView = localStorage.getItem("fa_last_view");
+                if (lastView && lastView !== "Welcome" && lastView !== "Loading" && lastView !== "Error") {
+                    ViewRouter.show(lastView);
+                } else {
+                    ViewRouter.show("Dashboard");
+                }
+            } else {
+                // Reset AppState to defaults
+                AppState.userEmail        = null;
+                AppState.userName         = null;
+                AppState.userProvider     = null;
+                AppState.hasSubscription  = false;
+                AppState.subscriptionId   = null;
+                AppState.subscriptionPlan = null;
+                AppState.erpConnected     = false;
+                AppState.erpType          = null;
+                AppState.erpOrgName       = null;
+                AppState.erpConnectedDate = null;
+
+                // Always show welcome screen
+                ViewRouter.show("Welcome");
+            }
+        }
+    };
+
+    // ============================================================
+    // 9. BOOT
+    // ============================================================
+    AppController.init();
+
+});

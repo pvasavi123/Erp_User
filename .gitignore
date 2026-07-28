@@ -1,0 +1,34 @@
+# Root / Global
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
+
+# Backend (Node.js / Express)
+Backend/node_modules/
+Backend/db.sqlite3
+Backend/db.sqlite3-journal
+Backend/.env
+
+# Admin (React + TypeScript / Vite)
+Admin/node_modules/
+Admin/dist/
+Admin/.env
+Admin/.env.local
+
+# Frontend (Excel Add-in / Webpack / Office JS)
+Frontend/node_modules/
+Frontend/dist/
+Frontend/.env
+
+# General Catch-all rules
+node_modules/
+env/
+venv/
+__pycache__/
+*.pyc
+.env
+.env.local
+*.sqlite3
+*.sqlite3-journal

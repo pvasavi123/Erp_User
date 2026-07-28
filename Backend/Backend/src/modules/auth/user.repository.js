@@ -1,0 +1,63 @@
+'use strict';
+
+const { User } = require('../../core/database');
+
+/**
+ * UserRepository
+ * ----------------------------------------------------------------
+ * Data-access layer for the users table.
+ * All Sequelize queries are contained here; services never import
+ * models directly.
+ * ----------------------------------------------------------------
+ */
+class UserRepository {
+
+    /**
+     * Find a user by their email address (case-insensitive via DB collation).
+     * @param {string} email
+     * @returns {Promise<User|null>}
+     */
+    static async findByEmail(email) {
+        return await User.findOne({ where: { email: email.toLowerCase().trim() } });
+    }
+
+    /**
+     * Find a user by their primary key.
+     * @param {number} id
+     * @returns {Promise<User|null>}
+     */
+    static async findById(id) {
+        return await User.findByPk(id);
+    }
+
+    /**
+     * Find a user by their Google OAuth subject ID.
+     * @param {string} googleId
+     * @returns {Promise<User|null>}
+     */
+    static async findByGoogleId(googleId) {
+        return await User.findOne({ where: { google_id: googleId } });
+    }
+
+    /**
+     * Create a new user record.
+     * @param {{ name, email, password_hash?, provider, google_id?, role? }} data
+     * @returns {Promise<User>}
+     */
+    static async create(data) {
+        return await User.create(data);
+    }
+
+    /**
+     * Update fields on an existing user.
+     * @param {number} id
+     * @param {object} data
+     * @returns {Promise<User>}
+     */
+    static async update(id, data) {
+        await User.update(data, { where: { id } });
+        return await User.findByPk(id);
+    }
+}
+
+module.exports = UserRepository;

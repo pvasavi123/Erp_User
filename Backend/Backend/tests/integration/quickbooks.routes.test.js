@@ -1,0 +1,55 @@
+const request = require('supertest');
+const app = require('../../src/app');
+const QuickBooksService = require('../../src/modules/quickbooks/service');
+const QuickBooksTokenRepository = require('../../src/modules/quickbooks/repository');
+
+jest.mock('../../src/modules/quickbooks/service');
+jest.mock('../../src/modules/quickbooks/repository');
+
+describe('QuickBooks Routes Integration', () => {
+    describe('GET /api/quickbooks/connect', () => {
+        it('should generate OAuth URL and redirect', async () => {
+            const res = await request(app).get('/api/quickbooks/connect');
+            expect(res.status).toBe(302); // Redirect
+            expect(res.header.location).toContain('appcenter.intuit.com/connect/oauth2');
+        });
+    });
+
+    describe('GET /api/quickbooks/customers', () => {
+        it('should return 200 and a list of mapped customers', async () => {
+            const mockCustomers = [
+                { id: '1', name: 'Your Name', email: 'Your Name@example.com', balance: 100 }
+            ];
+            QuickBooksService.getCustomers.mockResolvedValue(mockCustomers);
+
+            const res = await request(app).get('/api/quickbooks/customers');
+            expect(res.status).toBe(200);
+            expect(res.body.customers).toEqual(mockCustomers);
+        });
+
+        it('should return 500 if service throws an error', async () => {
+            QuickBooksService.getCustomers.mockRejectedValue(new Error('API Error'));
+
+            const res = await request(app).get('/api/quickbooks/customers');
+            expect(res.status).toBe(500);
+            expect(res.body.error).toBe('API Error');
+        });
+    });
+
+    describe('POST /api/quickbooks/disconnect', () => {
+        it('should clear tokens and return success', async () => {
+            QuickBooksTokenRepository.clearTokens.mockResolvedValue();
+
+            const res = await request(app).post('/api/quickbooks/disconnect');
+            expect(res.status).toBe(200);
+            expect(res.body.success).toBe(true);
+            expect(res.body.message).toBe('QuickBooks tokens cleared successfully.');
+            expect(QuickBooksTokenRepository.clearTokens).toHaveBeenCalledTimes(1);
+        });
+    });
+
+    afterAll(async () => {
+        const { sequelize } = require('../../src/core/database');
+        await sequelize.close();
+    });
+});
