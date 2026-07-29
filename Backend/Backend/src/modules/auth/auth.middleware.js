@@ -17,16 +17,31 @@ const UserRepository = require('./user.repository');
  */
 const authenticate = async (req, res, next) => {
     try {
-        const authHeader = req.headers.authorization;
+        let token = null;
 
-        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        // 1. Check Authorization header
+        const authHeader = req.headers.authorization;
+        if (authHeader && authHeader.startsWith('Bearer ')) {
+            token = authHeader.split(' ')[1];
+        }
+
+        // 2. Check query parameters (for GET popups/iframes)
+        if (!token && req.query && req.query.token) {
+            token = req.query.token;
+        }
+
+        // 3. Check request body (as fallback)
+        if (!token && req.body && req.body.token) {
+            token = req.body.token;
+        }
+
+        if (!token) {
             return res.status(401).json({
                 success: false,
-                message: 'Unauthorized: Missing or malformed authorization header'
+                message: 'Unauthorized: Missing or malformed authentication token'
             });
         }
 
-        const token   = authHeader.split(' ')[1];
         const decoded = JwtService.verifyToken(token);
 
         // Optionally load the full user record so downstream handlers have it

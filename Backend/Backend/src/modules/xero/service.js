@@ -8,6 +8,7 @@ const { encodeBasicAuth } = require('../../core/helpers');
 const XeroTokenRepository = require('./repository');
 const XeroMapper  = require('./mapper');
 const logger      = require('../../core/logger');
+const XeroTokenManager = require('./oauth/XeroTokenManager');
 
 /**
  * XeroService
@@ -150,31 +151,8 @@ class XeroService {
         if (!connections || connections.length === 0) throw new Error('Xero is not connected.');
 
         const token = connections[0];
-        const credentials = encodeBasicAuth(config.XERO.CLIENT_ID, config.XERO.CLIENT_SECRET);
-
-        const response = await axios.post(
-            CONSTANTS.XERO.TOKEN_URL,
-            new URLSearchParams({
-                grant_type:    'refresh_token',
-                refresh_token: token.refresh_token
-            }),
-            {
-                headers: {
-                    Authorization:  `Basic ${credentials}`,
-                    'Content-Type': 'application/x-www-form-urlencoded'
-                }
-            }
-        );
-
-        const data = response.data;
-        
-        // Update all tokens for all tenants with fresh access token
-        for (const t of connections) {
-            t.access_token  = data.access_token;
-            t.refresh_token = data.refresh_token;
-            await t.save();
-        }
-
+        const tenantId = token.companyId || token.tenant_id;
+        await XeroTokenManager.getValidToken(tenantId);
         return token;
     }
 
@@ -199,7 +177,7 @@ class XeroService {
         for (const token of tokens) {
             try {
                 const tenantId = token.companyId || token.tenant_id;
-                const accessToken = token.accessToken || token.access_token;
+                const accessToken = await XeroTokenManager.getValidToken(tenantId);
                 const headers = {
                     Authorization:    `Bearer ${accessToken}`,
                     'Xero-Tenant-Id': tenantId,
@@ -230,7 +208,7 @@ class XeroService {
         for (const token of tokens) {
             try {
                 const tenantId = token.companyId || token.tenant_id;
-                const accessToken = token.accessToken || token.access_token;
+                const accessToken = await XeroTokenManager.getValidToken(tenantId);
                 const headers = {
                     Authorization:    `Bearer ${accessToken}`,
                     'Xero-Tenant-Id': tenantId,
@@ -270,7 +248,7 @@ class XeroService {
         for (const token of tokens) {
             try {
                 const tenantId = token.companyId || token.tenant_id;
-                const accessToken = token.accessToken || token.access_token;
+                const accessToken = await XeroTokenManager.getValidToken(tenantId);
                 const headers = {
                     Authorization:    `Bearer ${accessToken}`,
                     'Xero-Tenant-Id': tenantId,
@@ -310,7 +288,7 @@ class XeroService {
         for (const token of tokens) {
             try {
                 const tenantId = token.companyId || token.tenant_id;
-                const accessToken = token.accessToken || token.access_token;
+                const accessToken = await XeroTokenManager.getValidToken(tenantId);
                 const headers = {
                     Authorization:    `Bearer ${accessToken}`,
                     'Xero-Tenant-Id': tenantId,
@@ -350,7 +328,7 @@ class XeroService {
         for (const token of tokens) {
             try {
                 const tenantId = token.companyId || token.tenant_id;
-                const accessToken = token.accessToken || token.access_token;
+                const accessToken = await XeroTokenManager.getValidToken(tenantId);
                 const headers = {
                     Authorization:    `Bearer ${accessToken}`,
                     'Xero-Tenant-Id': tenantId,
@@ -378,6 +356,182 @@ class XeroService {
         }
         return allLocations;
     }
+
+    // ── Self-contained Connections Management & Pulling ────────────────
+
+    static PLAN_LIMITS = { basic: 1, standard: 3, pro: 10 };
+
+    static getMaxConnections(plan) {
+        return XeroService.PLAN_LIMITS[(plan || 'pro').toLowerCase()] ?? 10;
+    }
+
+    static async listConnections(mail) {
+        const { XeroToken } = require('../../core/database');
+        const xeroWhere = mail ? { mail } : {};
+        const xeroTokens = await XeroToken.findAll({ where: xeroWhere });
+
+        return xeroTokens.map(t => ({
+            platform:     'Xero',
+            companyName:  t.company_name || 'Xero Organisation',
+            companyId:    t.tenant_id,
+            status:       t.status || 'Active',
+            lastSyncedAt: t.last_synced_at || t.updated_at || null,
+            createdAt:    t.created_at || null
+        }));
+    }
+
+    static async getConnectionStats(mail, plan) {
+        const { XeroToken } = require('../../core/database');
+        const { Op } = require('sequelize');
+        const maxAllowed = XeroService.getMaxConnections(plan);
+
+        const whereClause = { status: { [Op.ne]: 'Disconnected' } };
+        if (mail) whereClause.mail = mail;
+
+        const xeroCount = await XeroToken.count({ where: whereClause });
+
+        return {
+            plan: (plan || 'pro').toLowerCase(),
+            maxAllowed,
+            connected: xeroCount,
+            remaining: Math.max(0, maxAllowed - xeroCount)
+        };
+    }
+
+    static async disconnectConnection(companyId) {
+        const { XeroToken } = require('../../core/database');
+        const [updated] = await XeroToken.update(
+            { status: 'Disconnected' },
+            { where: { tenant_id: companyId } }
+        );
+        return updated > 0;
+    }
+
+    static async activateConnection(companyId) {
+        const { XeroToken } = require('../../core/database');
+        const [updated] = await XeroToken.update(
+            { status: 'Active' },
+            { where: { tenant_id: companyId } }
+        );
+        return updated > 0;
+    }
+
+    static async renameConnection(companyId, companyName) {
+        const { XeroToken } = require('../../core/database');
+        const [updated] = await XeroToken.update(
+            { company_name: companyName },
+            { where: { tenant_id: companyId } }
+        );
+        return updated > 0;
+    }
+
+    static async pullMasterData(companyId, tier) {
+        const { XeroToken } = require('../../core/database');
+        const maxAllowed = XeroService.getMaxConnections(tier);
+
+        const rawTokens = companyId
+            ? await XeroToken.findAll({ where: { tenant_id: companyId } })
+            : await XeroToken.findAll({ where: { status: 'Active' }, order: [['updated_at', 'DESC']] });
+
+        const tokens = rawTokens.slice(0, maxAllowed).map(t => ({
+            platform:     'xero',
+            companyId:    t.tenant_id,
+            companyName:  t.company_name || 'Xero Organisation',
+            accessToken:  t.access_token,
+            refreshToken: t.refresh_token,
+            tenant_id:    t.tenant_id,
+            access_token: t.access_token
+        }));
+
+        const aggregated = { company: [], customers: [], vendors: [], accounts: [], classes: [], locations: [] };
+
+        for (const token of tokens) {
+            try {
+                const headers = {
+                    Authorization:    `Bearer ${token.accessToken}`,
+                    'Xero-Tenant-Id': token.companyId,
+                    Accept:           'application/json'
+                };
+
+                const xeroGet = async (url) => {
+                    try {
+                        return await axios.get(url, { headers });
+                    } catch (err) {
+                        if (err.response?.status === 401) {
+                            const { encodeBasicAuth } = require('../../core/helpers');
+                            const config = require('../../core/config');
+                            const credentials = encodeBasicAuth(config.XERO.CLIENT_ID, config.XERO.CLIENT_SECRET);
+
+                            const refreshRes = await axios.post(
+                                CONSTANTS.XERO.TOKEN_URL,
+                                new URLSearchParams({ grant_type: 'refresh_token', refresh_token: token.refreshToken }),
+                                { headers: { Authorization: `Basic ${credentials}`, 'Content-Type': 'application/x-www-form-urlencoded' } }
+                            );
+
+                            token.accessToken  = refreshRes.data.access_token;
+                            token.refreshToken = refreshRes.data.refresh_token;
+                            headers.Authorization = `Bearer ${token.accessToken}`;
+
+                            await XeroToken.update(
+                                { access_token: token.accessToken, refresh_token: token.refreshToken },
+                                { where: { tenant_id: token.companyId } }
+                            );
+
+                            return axios.get(url, { headers });
+                        }
+                        throw err;
+                    }
+                };
+
+                const [orgRes, contactRes, accRes, classRes] = await Promise.all([
+                    xeroGet(CONSTANTS.XERO.ORGANISATION_URL).catch(() => null),
+                    xeroGet(CONSTANTS.XERO.CONTACTS_URL).catch(() => null),
+                    xeroGet(CONSTANTS.XERO.ACCOUNTS_URL).catch(() => null),
+                    xeroGet(CONSTANTS.XERO.TRACKING_CATEGORIES_URL).catch(() => null)
+                ]);
+
+                const company  = orgRes ? XeroMapper.toOrganisation(orgRes.data) : null;
+                const orgName  = company?.name || token.companyName;
+
+                if (company) { company.id = token.companyId; aggregated.company.push(company); }
+
+                const contacts  = contactRes ? XeroMapper.toContactList(contactRes.data) : [];
+                const accounts  = accRes     ? XeroMapper.toAccountList(accRes.data)     : [];
+                const classes   = classRes   ? XeroMapper.toTrackingList(classRes.data, 'class')    : [];
+                const locations = classRes   ? XeroMapper.toTrackingList(classRes.data, 'location') : [];
+
+                const tag = items => items.map(i => ({ ...i, clientId: orgName, clientName: orgName }));
+
+                aggregated.customers.push(...tag(contacts.filter(c =>  c.isCustomer || !c.isSupplier)));
+                aggregated.vendors.push(  ...tag(contacts.filter(c =>  c.isSupplier)));
+                aggregated.accounts.push( ...tag(accounts));
+                aggregated.classes.push(  ...tag(classes));
+                aggregated.locations.push(...tag(locations));
+
+                await XeroToken.update(
+                    { last_synced_at: new Date() },
+                    { where: { tenant_id: token.companyId } }
+                );
+            } catch (err) {
+                logger.error(`Error pulling Xero data for connection ${token.companyId}:`, err.message);
+            }
+        }
+
+        return aggregated;
+    }
 }
+
+// Register event listener for plan downgrades
+const eventBus = require('../../core/events');
+const { XeroToken } = require('../../core/database');
+
+eventBus.on('user.downgraded', async ({ email }) => {
+    try {
+        const deletedCount = await XeroToken.destroy({ where: { mail: email } });
+        logger.info(`[XeroService] Plan downgrade: cleared ${deletedCount} connections for ${email}`);
+    } catch (err) {
+        logger.error(`[XeroService] Failed to clear connections on downgrade for ${email}:`, err.message);
+    }
+});
 
 module.exports = XeroService;

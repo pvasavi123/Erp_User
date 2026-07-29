@@ -1,15 +1,90 @@
 'use strict';
 
-/**
- * Payments Controller
- * Renders a standalone checkout page for plan upgrades / changes.
- * The page mirrors the Secure Checkout UI used during the Google OAuth
- * onboarding flow so the experience is identical.
- */
-class PaymentsController {
+const BillingService     = require('./billing.service');
+const UserRepository     = require('../auth/user.repository');
+const logger             = require('../../core/logger');
 
+/**
+ * BillingController
+ * ------------------------------------------------------------------
+ * Handles HTTP requests for the billing bounded context.
+ * Merges the responsibilities of the old payments.controller.js and
+ * subscription.controller.js into one place.
+ *
+ * Delegation:
+ *   - All domain decisions  → BillingService
+ *   - DB user access        → UserRepository (via BillingService)
+ *   - HTML rendering        → inline template (checkout page)
+ * ------------------------------------------------------------------
+ */
+class BillingController {
+
+    constructor() {
+        // Compose BillingService with its dependencies here (composition root).
+        // Swap UserRepository with mocks in tests.
+        this.billingService = new BillingService(UserRepository);
+    }
+
+    // ----------------------------------------------------------------
+    // POST /api/subscription/upgrade
+    // Requires JWT authentication (enforced by router middleware).
+    // ----------------------------------------------------------------
+    upgrade = async (req, res) => {
+        try {
+            const { plan } = req.body;
+            if (!plan) {
+                return res.status(400).json({ success: false, message: 'Missing plan.' });
+            }
+
+            const result = await this.billingService.upgradePlanById(req.user.userId, plan);
+
+            logger.info(
+                `[Billing] User ${req.user.userId} changed plan: ` +
+                `${result.oldPlan} → ${result.newPlan}` +
+                (result.isDowngrade ? ' (downgrade — connections cleared)' : '')
+            );
+
+            return res.json({ success: true, message: 'Plan updated successfully.', ...result });
+        } catch (error) {
+            const statusCode = error.statusCode || 500;
+            logger.error('[Billing] upgrade error:', error.message);
+            return res.status(statusCode).json({ success: false, message: error.message || 'Internal server error.' });
+        }
+    };
+
+    // ----------------------------------------------------------------
+    // POST /api/payments/complete
+    // Called by the checkout popup after the mock payment succeeds.
+    // ----------------------------------------------------------------
+    completePayment = async (req, res) => {
+        try {
+            const { email, plan } = req.body;
+            if (!email || !plan) {
+                return res.status(400).json({ success: false, message: 'Email and plan are required.' });
+            }
+
+            const result = await this.billingService.upgradePlanByEmail(email, plan);
+
+            logger.info(
+                `[Billing] Checkout completed for ${email}: ` +
+                `${result.oldPlan} → ${result.newPlan}` +
+                (result.isDowngrade ? ' (downgrade — connections cleared)' : '')
+            );
+
+            return res.json({ success: true, message: 'Plan updated successfully.', ...result });
+        } catch (error) {
+            const statusCode = error.statusCode || 500;
+            logger.error('[Billing] completePayment error:', error.message);
+            return res.status(statusCode).json({ success: false, message: error.message || 'Internal server error.' });
+        }
+    };
+
+    // ----------------------------------------------------------------
     // GET /api/payments/checkout?plan=Basic&price=699&cycle=Monthly&email=...
-    checkout(req, res) {
+    // Renders the standalone secure checkout page (opened in a popup).
+    // No auth required — user authenticates through the payment flow.
+    // ----------------------------------------------------------------
+    checkout = (req, res) => {
         const plan  = req.query.plan  || 'Basic';
         const price = parseInt(req.query.price, 10) || 699;
         const cycle = req.query.cycle || 'Monthly';
@@ -35,8 +110,6 @@ class PaymentsController {
       font-size: 14px;
       -webkit-font-smoothing: antialiased;
     }
-
-    /* ---- HEADER ---- */
     .header {
       background: #172b56;
       padding: 12px 20px;
@@ -57,12 +130,8 @@ class PaymentsController {
       font-weight: 800; font-size: 13px; color: #172b56;
     }
     .brand { color: white; font-size: 15px; font-weight: 700; letter-spacing: -.3px; }
-
-    /* ---- SCREEN TRANSITIONS ---- */
     .screen { display: none; flex-direction: column; flex: 1; }
     .screen.active { display: flex; }
-
-    /* ---- PAYMENT SCREEN ---- */
     .pay-wrap { flex: 1; overflow-y: auto; padding: 20px; }
     .back-btn {
       background: none; border: none; color: #2459dd;
@@ -116,8 +185,6 @@ class PaymentsController {
     }
     .pay-btn:hover { box-shadow: 0 6px 18px rgba(36,89,221,0.35); }
     .secure-badge { text-align: center; font-size: 10px; color: #8a98b8; margin-top: 12px; }
-
-    /* ---- PROCESSING SCREEN ---- */
     .processing-wrap { display: flex; flex-direction: column; align-items: center; justify-content: center; flex: 1; padding: 40px; }
     .proc-spinner {
       width: 44px; height: 44px;
@@ -128,8 +195,6 @@ class PaymentsController {
     @keyframes spin { to { transform: rotate(360deg); } }
     .proc-title { font-size: 15px; font-weight: 700; margin-top: 20px; }
     .proc-sub { font-size: 12px; color: #6b7a9a; margin-top: 6px; }
-
-    /* ---- SUCCESS SCREEN ---- */
     .success-wrap { display: flex; flex-direction: column; align-items: center; justify-content: center; flex: 1; padding: 30px; text-align: center; }
     .success-icon { font-size: 52px; margin-bottom: 16px; }
     .success-title { font-size: 20px; font-weight: 800; margin-bottom: 6px; }
@@ -140,8 +205,6 @@ class PaymentsController {
       cursor: pointer;
     }
     .done-btn:hover { background: #1a3db8; }
-
-    /* ---- SECURE CHECKOUT SCREEN (initial) ---- */
     .checkout-info {
       background: linear-gradient(135deg, #f0f4ff 0%, #e8f0fe 100%);
       border-radius: 14px; padding: 24px; text-align: center; margin-bottom: 18px;
@@ -154,7 +217,6 @@ class PaymentsController {
   </style>
 </head>
 <body>
-  <!-- HEADER -->
   <div class="header">
     <div class="header-left">
       <div class="logo">FA</div>
@@ -166,7 +228,6 @@ class PaymentsController {
   <div id="screenCheckout" class="screen active">
     <div class="pay-wrap">
       <div class="pay-title">Secure Checkout</div>
-
       <div class="order-card">
         <div class="order-row">
           <span class="order-lbl">Plan</span>
@@ -182,13 +243,11 @@ class PaymentsController {
           <span class="order-total-val" id="payTotal">₹${price}</span>
         </div>
       </div>
-
       <div class="checkout-info">
         <div class="checkout-lock">🔐</div>
         <div class="checkout-info-title">Secure Payment Processing</div>
         <div class="checkout-info-sub">You will be redirected to our secure payment portal to complete your subscription. Card details are handled entirely by our payment provider — never stored by FinAccrual.</div>
       </div>
-
       <button class="pay-btn" onclick="showScreen('Payment')">Open Secure Checkout</button>
       <div style="text-align:center; margin-top: 12px;">
         <span style="font-size: 11px; color: #6b7a9a;">Already paid? </span>
@@ -197,20 +256,17 @@ class PaymentsController {
     </div>
   </div>
 
-  <!-- SCREEN 2: PAYMENT -->
+  <!-- SCREEN 2: PAYMENT FORM -->
   <div id="screenPayment" class="screen">
     <div class="pay-wrap">
       <button class="back-btn" onclick="showScreen('Checkout')">← Back</button>
       <div class="pay-title">Secure Checkout</div>
-
       <div class="order-card">
         <div class="order-row">
-          <span class="order-lbl">Plan</span>
-          <span class="order-val">${plan}</span>
+          <span class="order-lbl">Plan</span><span class="order-val">${plan}</span>
         </div>
         <div class="order-row">
-          <span class="order-lbl">Billing</span>
-          <span class="order-val">${cycle}</span>
+          <span class="order-lbl">Billing</span><span class="order-val">${cycle}</span>
         </div>
         <div class="order-divider"></div>
         <div class="order-row">
@@ -218,7 +274,6 @@ class PaymentsController {
           <span class="order-total-val">₹${price}</span>
         </div>
       </div>
-
       <div class="pay-card">
         <div class="pay-card-title">💳 Payment Details</div>
         <div class="card-icons">
@@ -277,37 +332,31 @@ class PaymentsController {
     var selectedCycle = '${cycle}';
     var userEmail     = '${email}';
 
-    /* Screen switcher */
     function showScreen(id) {
       document.querySelectorAll('.screen').forEach(function(s) { s.classList.remove('active'); });
       document.getElementById('screen' + id).classList.add('active');
     }
 
-    /* Card number formatting */
     function formatCard(input) {
       var v = input.value.replace(/\\D/g, '').substring(0, 16);
       input.value = v.replace(/(.{4})/g, '$1 ').trim();
     }
 
-    /* Expiry formatting */
     function formatExp(input) {
       var v = input.value.replace(/\\D/g, '').substring(0, 4);
       if (v.length >= 2) v = v.substring(0,2) + ' / ' + v.substring(2);
       input.value = v;
     }
 
-    /* Mock payment processing */
     function processPayment() {
       var name = document.getElementById('cardName').value.trim();
       var num  = document.getElementById('cardNum').value.trim();
       var exp  = document.getElementById('cardExp').value.trim();
       var cvv  = document.getElementById('cardCvv').value.trim();
-
       if (!name || !num || num.replace(/\\s/g,'').length < 16 || !exp || cvv.length < 3) {
         alert('Please fill in all payment details correctly.');
         return;
       }
-
       fetch('/api/payments/complete', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -319,19 +368,16 @@ class PaymentsController {
       setTimeout(function() { showScreen('Success'); }, 2200);
     }
 
-    /* Verify payment (mock) */
     function verifyPayment() {
       fetch('/api/payments/complete', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: userEmail, plan: selectedPlan })
       }).catch(function(err) { console.error('Error completing payment:', err); });
-
       showScreen('Processing');
       setTimeout(function() { showScreen('Success'); }, 2200);
     }
 
-    /* Send payment_success message to opener and close */
     function finishFlow() {
       var payload = {
         type:           'payment_success',
@@ -352,52 +398,7 @@ class PaymentsController {
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
 </body>
 </html>`);
-    }
-
-    // POST /api/payments/complete
-    async completePayment(req, res) {
-        try {
-            const { email, plan } = req.body;
-            if (!email || !plan) {
-                return res.status(400).json({ success: false, message: 'Email and plan are required.' });
-            }
-
-            const UserRepository = require('../auth/user.repository');
-            const logger = require('../../core/logger');
-
-            const user = await UserRepository.findByEmail(email);
-            if (!user) {
-                return res.status(404).json({ success: false, message: 'User not found.' });
-            }
-
-            const oldPlan = user.plan;
-            const planWeights = {
-                'basic': 1,
-                'standard': 2,
-                'pro': 3
-            };
-
-            const oldPlanKey = (oldPlan || 'Pro').toLowerCase();
-            const newPlanKey = plan.toLowerCase();
-            const isDowngrade = (planWeights[newPlanKey] || 0) < (planWeights[oldPlanKey] || 0);
-
-            await UserRepository.update(user.id, { plan });
-
-            if (isDowngrade) {
-                const { QuickBooksToken, XeroToken } = require('../../core/database');
-                await QuickBooksToken.destroy({ where: { mail: email } });
-                await XeroToken.destroy({ where: { mail: email } });
-                logger.info(`User ${user.id} downgraded from ${oldPlan} to ${plan} via checkout. Cleared company connections.`);
-            }
-
-            logger.info(`User ${user.id} updated plan to ${plan} via checkout.`);
-            return res.json({ success: true, message: 'Plan updated successfully.' });
-        } catch (error) {
-            const logger = require('../../core/logger');
-            logger.error('completePayment error', error.message);
-            return res.status(500).json({ success: false, message: 'Internal server error.' });
-        }
-    }
+    };
 }
 
-module.exports = new PaymentsController();
+module.exports = new BillingController();

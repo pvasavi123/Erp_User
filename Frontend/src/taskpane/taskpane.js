@@ -39,6 +39,9 @@ Office.onReady(() => {
         erpConnectedDate: localStorage.getItem("fa_erp_date") || null,
         forceWelcome:     false,
 
+        // JWT token — persisted across sessions
+        jwtToken:         localStorage.getItem("fa_jwt_token") || null,
+
         // ERP Operations
         currentProvider: "quickbooks",
         get currentTier() {
@@ -81,10 +84,33 @@ Office.onReady(() => {
     // 3. API SERVICE LAYER
     // ============================================================
     const ApiService = {
+        // ── Single source-of-truth for the backend base URL ────────────
         BASE: "http://localhost:8000",
 
         /**
+         * Authenticated fetch helper.
+         * Automatically attaches the JWT Bearer token from AppState to every
+         * request so all callers never have to think about auth headers.
+         *
+         * Usage (same API as window.fetch):
+         *   const res = await ApiService.apiFetch('/api/connections', { method: 'GET' });
+         *
+         * @param {string}  path     - Relative (/api/...) or absolute URL
+         * @param {object}  options  - Standard fetch options (method, body, headers, …)
+         * @returns {Promise<Response>}
+         */
+        apiFetch(path, options = {}) {
+            const url = path.startsWith("http") ? path : `${this.BASE}${path}`;
+            const headers = { ...(options.headers || {}) };
+            if (AppState.jwtToken) {
+                headers["Authorization"] = `Bearer ${AppState.jwtToken}`;
+            }
+            return fetch(url, { ...options, headers });
+        },
+
+        /**
          * Checks subscription status for the given email from backend.
+         * Also stores the JWT token if the server returns one.
          * Falls back gracefully if backend is down (for UI-only phase).
          */
         async checkSubscription(email) {
@@ -95,40 +121,46 @@ Office.onReady(() => {
                     body: JSON.stringify({ email })
                 });
                 if (!res.ok) return { hasSubscription: false };
-                return await res.json();
+                const result = await res.json();
+                // Persist the token if the backend returned one
+                if (result.token) {
+                    AppState.jwtToken = result.token;
+                    localStorage.setItem("fa_jwt_token", result.token);
+                }
+                return result;
             } catch {
                 return { hasSubscription: AppState.hasSubscription };
             }
         },
 
-        /** Checks ERP token validity from backend. */
+        /** Checks ERP token validity from backend (JWT required). */
         async checkTokens(provider) {
-            const url = provider === "quickbooks"
-                ? `${this.BASE}/api/quickbooks/tokens/`
-                : `${this.BASE}/api/xero/tokens`;
-            const res = await fetch(url);
+            const path = provider === "quickbooks"
+                ? "/api/quickbooks/tokens/"
+                : "/api/xero/tokens";
+            const res = await this.apiFetch(path);
             if (!res.ok) throw new Error(`Failed to check ${provider} tokens.`);
             return await res.json();
         },
 
-        /** Disconnects the ERP provider from backend. */
+        /** Disconnects the ERP provider from backend (JWT required). */
         async disconnectERP(provider) {
-            const url = provider === "quickbooks"
-                ? `${this.BASE}/api/quickbooks/disconnect`
-                : `${this.BASE}/api/xero/disconnect`;
-            const res = await fetch(url, { method: "POST" });
+            const path = provider === "quickbooks"
+                ? "/api/quickbooks/disconnect"
+                : "/api/xero/disconnect";
+            const res = await this.apiFetch(path, { method: "POST" });
             if (!res.ok) throw new Error(`Failed to disconnect ${provider}.`);
             return await res.json();
         },
 
         /**
          * Pulls master metadata from ERP APIs via the unified backend pull endpoint.
-         * @param {string} provider - The active ERP provider ("quickbooks" | "xero")
+         * @param {string} provider  - The active ERP provider ("quickbooks" | "xero")
          * @param {string} companyId - Selected company identifier
          * @returns {Promise<object>} Map of company, customers, vendors, accounts, classes, locations
          */
         async fetchMasterData(provider, companyId) {
-            const res = await fetch(`${this.BASE}/api/pull-master-data`, {
+            const res = await this.apiFetch("/api/pull-master-data", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ companyId, platform: provider, tier: AppState.currentTier })
@@ -469,13 +501,19 @@ Office.onReady(() => {
          * @param {string} subscriptionId
          * @param {string} plan
          */
-        handleNewUserAuthed(email, name, provider, subscriptionId, plan) {
+        handleNewUserAuthed(email, name, provider, subscriptionId, plan, token) {
             AppState.userEmail        = email;
             AppState.userName         = name;
             AppState.userProvider     = provider;
             AppState.hasSubscription  = true;
             AppState.subscriptionId   = subscriptionId;
             AppState.subscriptionPlan = plan;
+
+            // Persist the JWT token so all subsequent API calls are authenticated
+            if (token) {
+                AppState.jwtToken = token;
+                localStorage.setItem("fa_jwt_token", token);
+            }
 
             localStorage.setItem("fa_user_email",      email);
             localStorage.setItem("fa_user_name",       name);
@@ -493,13 +531,19 @@ Office.onReady(() => {
          * @param {string} name
          * @param {string} provider
          */
-        async handleReturningUser(email, name, provider) {
+        async handleReturningUser(email, name, provider, token) {
             AppState.userEmail    = email;
             AppState.userName     = name;
             AppState.userProvider = provider;
             localStorage.setItem("fa_user_email",    email);
             localStorage.setItem("fa_user_name",     name);
             localStorage.setItem("fa_user_provider", provider);
+
+            // Persist token from popup if provided (avoids a round-trip)
+            if (token) {
+                AppState.jwtToken = token;
+                localStorage.setItem("fa_jwt_token", token);
+            }
 
             ViewRouter.show("Loading");
             try {
@@ -529,7 +573,7 @@ Office.onReady(() => {
          * - On logout click:    popup sends  { type: 'google_cancelled' }
          */
         openGooglePopup() {
-            const googleAuthUrl = "http://localhost:8000/api/auth/google/connect";
+            const googleAuthUrl = `${ApiService.BASE}/api/auth/google/connect`;
 
             const msgHandler = (event) => {
                 if (!event.data) return;
@@ -548,7 +592,8 @@ Office.onReady(() => {
                         data.name  || data.email || "",
                         "google",
                         data.subscriptionId || "",
-                        data.plan           || "Starter"
+                        data.plan           || "Starter",
+                        data.token          || ""
                     );
                 } else if (data.type === "google_profile") {
                     // Returning user — popup closed immediately, check backend
@@ -556,7 +601,8 @@ Office.onReady(() => {
                     AuthService.handleReturningUser(
                         data.email || "",
                         data.name  || data.email || "",
-                        "google"
+                        "google",
+                        data.token || ""
                     );
                 } else if (data.type === "google_cancelled") {
                     // User clicked logout in the popup
@@ -582,7 +628,7 @@ Office.onReady(() => {
          * In production, replace with real Microsoft MSAL / OAuth URL.
          */
         openMicrosoftPopup() {
-            const mockMSUrl = "http://localhost:8000/api/microsoft/connect";
+            const mockMSUrl = `${ApiService.BASE}/api/microsoft/connect`;
 
             const msgHandler = (event) => {
                 if (!event.data) return;
@@ -599,14 +645,16 @@ Office.onReady(() => {
                         data.name  || data.email || "",
                         "microsoft",
                         data.subscriptionId || "",
-                        data.plan           || "Starter"
+                        data.plan           || "Starter",
+                        data.token          || ""
                     );
                 } else if (data.type === "ms_profile" || data.type === "microsoft_profile") {
                     window.removeEventListener("message", msgHandler);
                     AuthService.handleReturningUser(
                         data.email || "",
                         data.name  || data.email || "",
-                        "microsoft"
+                        "microsoft",
+                        data.token || ""
                     );
                 } else if (data.type === "ms_cancelled" || data.type === "google_cancelled") {
                     window.removeEventListener("message", msgHandler);
@@ -648,15 +696,17 @@ Office.onReady(() => {
             AppState.erpType          = null;
             AppState.erpOrgName       = null;
             AppState.erpConnectedDate = null;
+            AppState.jwtToken         = null;  // Clear the JWT token on logout
 
             [
                 "fa_user_email", "fa_user_name", "fa_user_provider",
                 "fa_has_subscription", "fa_subscription_id", "fa_subscription_plan",
-                "fa_erp_connected", "fa_erp_type", "fa_erp_org", "fa_erp_date", "fa_last_view"
+                "fa_erp_connected", "fa_erp_type", "fa_erp_org", "fa_erp_date",
+                "fa_last_view", "fa_jwt_token"
             ].forEach(k => localStorage.removeItem(k));
 
             try {
-                fetch("http://localhost:8000/api/auth/logout", { method: "POST" }).catch(() => {});
+                ApiService.apiFetch("/api/auth/logout", { method: "POST" }).catch(() => {});
             } catch (_) {}
 
             ViewRouter.show("Welcome");
@@ -676,7 +726,8 @@ Office.onReady(() => {
             AppState.pendingPrice = price;
             AppState.pendingCycle = cycle;
 
-            const checkoutUrl = `http://localhost:8000/api/payments/checkout?plan=${encodeURIComponent(plan)}&price=${price}&cycle=${encodeURIComponent(cycle)}&email=${encodeURIComponent(AppState.userEmail || "")}`;
+            const tokenParam  = AppState.jwtToken ? `&token=${encodeURIComponent(AppState.jwtToken)}` : "";
+            const checkoutUrl = `${ApiService.BASE}/api/payments/checkout?plan=${encodeURIComponent(plan)}&price=${price}&cycle=${encodeURIComponent(cycle)}&email=${encodeURIComponent(AppState.userEmail || "")}${tokenParam}`;
 
             const btnText    = document.getElementById("checkoutBtnText");
             const btnSpinner = document.getElementById("checkoutSpinner");
@@ -885,7 +936,7 @@ Office.onReady(() => {
             const connSection = document.getElementById("dashConnected");
             const connectingSection = document.getElementById("dashConnecting");
 
-            fetch("http://localhost:8000/api/connections?mail=" + encodeURIComponent(AppState.userEmail || ""))
+            ApiService.apiFetch("/api/connections?mail=" + encodeURIComponent(AppState.userEmail || ""))
                 .then(r => r.json())
                 .then(conns => {
                     const dropdown = document.getElementById("companySelectDropdown");
@@ -1047,9 +1098,9 @@ Office.onReady(() => {
                                 try {
                                     for (const c of xeroConns) {
                                         if (xeroSelected.has(c.companyId)) {
-                                            await fetch(`http://localhost:8000/api/connections/${c.companyId}/activate`, { method: "POST" });
+                                            await ApiService.apiFetch(`/api/connections/${c.companyId}/activate`, { method: "POST" });
                                         } else {
-                                            await fetch(`http://localhost:8000/api/connections/${c.companyId}`, { method: "DELETE" });
+                                            await ApiService.apiFetch(`/api/connections/${c.companyId}`, { method: "DELETE" });
                                         }
                                     }
 
@@ -1255,7 +1306,7 @@ Office.onReady(() => {
 
             ExcelService.clearMasterData().catch(err => console.error("Error clearing Excel data: ", err));
             
-            fetch(`http://localhost:8000/api/connections/${companyId}/activate`, { method: "POST" })
+            ApiService.apiFetch(`/api/connections/${companyId}/activate`, { method: "POST" })
                 .then(() => {
                     this.renderERPSection();
                 })
@@ -1292,7 +1343,7 @@ Office.onReady(() => {
                     menu.style.display = "none";
                     this.showStatus(`Disconnecting ${company.companyName}...`, "success");
                     try {
-                        await fetch(`http://localhost:8000/api/connections/${company.companyId}`, { method: "DELETE" });
+                        await ApiService.apiFetch(`/api/connections/${company.companyId}`, { method: "DELETE" });
                         // If we disconnected the currently active company, reset it so a new one is picked
                         if (AppState.currentCompanyId === company.companyId) {
                             AppState.currentCompanyId = null;
@@ -1332,7 +1383,7 @@ Office.onReady(() => {
                     if (!newName) return;
                     confirmBtn.disabled = true;
                     try {
-                        const res = await fetch(`http://localhost:8000/api/connections/${company.companyId}/rename`, {
+                        const res = await ApiService.apiFetch(`/api/connections/${company.companyId}/rename`, {
                             method: "PATCH",
                             headers: { "Content-Type": "application/json" },
                             body: JSON.stringify({ companyName: newName })
@@ -1432,9 +1483,10 @@ Office.onReady(() => {
             const isQB  = provider === "quickbooks";
             const pName = isQB ? "QuickBooks" : "Xero";
             const encodedMail = encodeURIComponent(AppState.userEmail || "");
+            const tokenParam  = AppState.jwtToken ? `&token=${encodeURIComponent(AppState.jwtToken)}` : "";
             const connectUrl = isQB
-                ? `http://localhost:8000/api/quickbooks/connect/?tier=${AppState.currentTier}&mail=${encodedMail}`
-                : `http://localhost:8000/api/xero/connect?tier=${AppState.currentTier}&mail=${encodedMail}`;
+                ? `${ApiService.BASE}/api/quickbooks/connect/?tier=${AppState.currentTier}&mail=${encodedMail}${tokenParam}`
+                : `${ApiService.BASE}/api/xero/connect?tier=${AppState.currentTier}&mail=${encodedMail}${tokenParam}`;
 
             this.addLog(`Opening ${pName} sign-in...`);
             this.showStatus(`Opening ${pName} sign-in...`, "success");
@@ -1521,8 +1573,8 @@ Office.onReady(() => {
 
             // Attempt to fetch org name from backend
             const tokenUrl = isQB
-                ? "http://localhost:8000/api/quickbooks/tokens/"
-                : "http://localhost:8000/api/xero/tokens";
+                ? `${ApiService.BASE}/api/quickbooks/tokens/`
+                : `${ApiService.BASE}/api/xero/tokens`;
 
             fetch(tokenUrl)
                 .then(r => r.json())
@@ -1615,11 +1667,11 @@ Office.onReady(() => {
             // Disconnect ALL companies for this user from the backend
             try {
                 const mail = AppState.userEmail || "";
-                const connsRes = await fetch(`http://localhost:8000/api/connections?mail=${encodeURIComponent(mail)}`);
+                const connsRes = await ApiService.apiFetch(`/api/connections?mail=${encodeURIComponent(mail)}`);
                 const conns = await connsRes.json();
                 const activeConns = (conns || []).filter(c => c.status !== 'Disconnected');
                 await Promise.all(activeConns.map(c =>
-                    fetch(`http://localhost:8000/api/connections/${c.companyId}`, { method: "DELETE" }).catch(() => {})
+                    ApiService.apiFetch(`/api/connections/${c.companyId}`, { method: "DELETE" }).catch(() => {})
                 ));
             } catch (_) {}
 
@@ -1869,7 +1921,7 @@ Office.onReady(() => {
             document.getElementById("btnConnectQB")?.addEventListener("click", async () => {
                 try {
                     const mail = AppState.userEmail || "";
-                    const res = await fetch(`http://localhost:8000/api/connections?mail=${encodeURIComponent(mail)}`);
+                    const res = await ApiService.apiFetch(`/api/connections?mail=${encodeURIComponent(mail)}`);
                     const allConns = await res.json();
                     const qbConns = (allConns || []).filter(c => (c.platform || "").toLowerCase() === "quickbooks");
                     if (qbConns.length > 0) {
@@ -1878,7 +1930,7 @@ Office.onReady(() => {
                         AppState.currentCompanyId = toActivate.companyId;
                         AppState.currentProvider = "quickbooks";
                         AppState.erpType = "quickbooks";
-                        await fetch(`http://localhost:8000/api/connections/${toActivate.companyId}/activate`, { method: "POST" });
+                        await ApiService.apiFetch(`/api/connections/${toActivate.companyId}/activate`, { method: "POST" });
                         DashboardService.renderERPSection();
                         DashboardService.showStatus(`Resumed QuickBooks session for ${toActivate.companyName}`, "success");
                         return;
@@ -1893,7 +1945,7 @@ Office.onReady(() => {
             document.getElementById("btnConnectXero")?.addEventListener("click", async () => {
                 try {
                     const mail = AppState.userEmail || "";
-                    const res = await fetch(`http://localhost:8000/api/connections?mail=${encodeURIComponent(mail)}`);
+                    const res = await ApiService.apiFetch(`/api/connections?mail=${encodeURIComponent(mail)}`);
                     const allConns = await res.json();
                     const xeroConns = (allConns || []).filter(c => (c.platform || "").toLowerCase() === "xero");
                     if (xeroConns.length > 0) {
@@ -1902,7 +1954,7 @@ Office.onReady(() => {
                         AppState.currentCompanyId = toActivate.companyId;
                         AppState.currentProvider = "xero";
                         AppState.erpType = "xero";
-                        await fetch(`http://localhost:8000/api/connections/${toActivate.companyId}/activate`, { method: "POST" });
+                        await ApiService.apiFetch(`/api/connections/${toActivate.companyId}/activate`, { method: "POST" });
                         DashboardService.renderERPSection();
                         DashboardService.showStatus(`Resumed Xero session for ${toActivate.companyName}`, "success");
                         return;
@@ -1942,7 +1994,7 @@ Office.onReady(() => {
                 
                 console.log("handleAddCompanyClick: provider = " + provider + ", AppState.currentProvider = " + AppState.currentProvider);
 
-                fetch("http://localhost:8000/api/connections?mail=" + encodeURIComponent(AppState.userEmail || ""))
+                ApiService.apiFetch("/api/connections?mail=" + encodeURIComponent(AppState.userEmail || ""))
                     .then(r => r.json())
                     .then(conns => {
                         const connsForProvider = (conns || []).filter(c => 
@@ -1974,7 +2026,7 @@ Office.onReady(() => {
                 const modalList = document.getElementById("modalCompanyList");
                 if (!modal || !modalList) return;
 
-                fetch("http://localhost:8000/api/connections?mail=" + encodeURIComponent(AppState.userEmail || ""))
+                ApiService.apiFetch("/api/connections?mail=" + encodeURIComponent(AppState.userEmail || ""))
                     .then(r => r.json())
                     .then(conns => {
                         modalList.innerHTML = "";
@@ -2037,7 +2089,7 @@ Office.onReady(() => {
                     }
                     ExcelService.clearMasterData().catch(err => console.error("Error clearing Excel data: ", err));
                     try {
-                        await fetch(`http://localhost:8000/api/connections/${selectedModalCompanyId}/activate`, { method: "POST" });
+                        await ApiService.apiFetch(`/api/connections/${selectedModalCompanyId}/activate`, { method: "POST" });
                     } catch (_) {}
                     DashboardService.renderERPSection();
                     DashboardService.showStatus("Active company switched successfully.", "success");
@@ -2069,7 +2121,7 @@ Office.onReady(() => {
                 
                 DashboardService.showStatus("Disconnecting company...", "success");
                 try {
-                    const res = await fetch(`http://localhost:8000/api/connections/${companyId}`, {
+                    const res = await ApiService.apiFetch(`/api/connections/${companyId}`, {
                         method: "DELETE"
                     });
                     if (res.ok) {
@@ -2095,7 +2147,7 @@ Office.onReady(() => {
                     ExcelService.clearMasterData().catch(err => console.error("Error clearing Excel data: ", err));
 
                     // Activate in backend and re-render
-                    fetch(`http://localhost:8000/api/connections/${opt.value}/activate`, { method: "POST" })
+                    ApiService.apiFetch(`/api/connections/${opt.value}/activate`, { method: "POST" })
                         .then(() => DashboardService.renderERPSection())
                         .catch(() => DashboardService.renderERPSection());
 
