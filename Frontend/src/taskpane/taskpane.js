@@ -1135,7 +1135,7 @@ Office.onReady(() => {
                                 </div>
                             `;
 
-                            // Click radio or card row to make active
+                            // Click radio or card row to make active (ignore for disconnected companies)
                             item.addEventListener("click", (e) => {
                                 if (e.target.classList.contains("fa-btn-dots")) {
                                     e.stopPropagation();
@@ -1146,6 +1146,10 @@ Office.onReady(() => {
                                     e.stopPropagation();
                                     this.showStatus("Launching re-authorization...", "success");
                                     this.launchERPOAuth((c.platform || "quickbooks").toLowerCase());
+                                    return;
+                                }
+                                if (isDisconnected) {
+                                    // Do not activate disconnected companies on box click
                                     return;
                                 }
                                 this.switchActiveCompany(c.companyId, platformConns);
@@ -1293,6 +1297,7 @@ Office.onReady(() => {
                         if (AppState.currentCompanyId === company.companyId) {
                             AppState.currentCompanyId = null;
                         }
+                        try { await ExcelService.clearMasterData(); } catch (_) {}
                         this.showStatus("Company disconnected.", "success");
                         this.renderERPSection();
                     } catch (_) {

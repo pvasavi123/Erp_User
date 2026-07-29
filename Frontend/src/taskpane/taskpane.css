@@ -2667,6 +2667,23 @@ input:checked + .toggle-slider::before {
   padding: 2px 8px;
   letter-spacing: 0.3px;
 }
+.fa-btn-reconnect {
+  background: #fff;
+  color: #173b7a;
+  border: 1.5px solid #173b7a;
+  border-radius: 20px;
+  font-size: 9px;
+  font-weight: 700;
+  padding: 3px 10px;
+  letter-spacing: 0.3px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.15s, color 0.15s;
+}
+.fa-btn-reconnect:hover {
+  background: #173b7a;
+  color: #fff;
+}
 .fa-btn-switch {
   padding: 4px 10px;
   border: 1.5px solid #e2e8f4;
