@@ -89,6 +89,12 @@ class BillingController {
         const price = parseInt(req.query.price, 10) || 699;
         const cycle = req.query.cycle || 'Monthly';
         const email = req.query.email || '';
+        // POST /api/payments/complete requires JWT auth. The GET request for
+        // this page itself carries the token as a query param (authenticate
+        // middleware's fallback #2), but that token was never threaded into
+        // the rendered page's own JS — so the page's own completion request
+        // had no way to authenticate and was always rejected with 401.
+        const token = req.query.token || '';
 
         return res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -302,6 +308,7 @@ class BillingController {
         <button class="pay-btn" id="payBtn" onclick="processPayment()">
           <span id="payBtnText">Complete Payment</span>
         </button>
+        <div id="payError" style="display:none; color:#dc2626; font-size:11px; text-align:center; margin-top:10px;"></div>
         <div class="secure-badge">🔒 256-bit SSL encrypted • PCI DSS compliant</div>
       </div>
     </div>
@@ -331,6 +338,7 @@ class BillingController {
     var selectedPrice = ${price};
     var selectedCycle = '${cycle}';
     var userEmail     = '${email}';
+    var authToken     = '${token}';
 
     function showScreen(id) {
       document.querySelectorAll('.screen').forEach(function(s) { s.classList.remove('active'); });
@@ -348,34 +356,76 @@ class BillingController {
       input.value = v;
     }
 
+    // Resets the pay button back to a clickable state and shows an inline
+    // error message. Deliberately does NOT depend on alert() — some popup
+    // contexts block or silently swallow alert(), which previously left
+    // the button stuck on "Processing..." forever with no way to retry.
+    function resetPayButtonWithError(message) {
+      var payBtn     = document.getElementById('payBtn');
+      var payBtnText = document.getElementById('payBtnText');
+      var payError   = document.getElementById('payError');
+      if (payBtn) payBtn.disabled = false;
+      if (payBtnText) payBtnText.textContent = 'Complete Payment';
+      if (payError) {
+        payError.textContent = message;
+        payError.style.display = 'block';
+      }
+    }
+
     function processPayment() {
       var name = document.getElementById('cardName').value.trim();
       var num  = document.getElementById('cardNum').value.trim();
       var exp  = document.getElementById('cardExp').value.trim();
       var cvv  = document.getElementById('cardCvv').value.trim();
       if (!name || !num || num.replace(/\\s/g,'').length < 16 || !exp || cvv.length < 3) {
-        alert('Please fill in all payment details correctly.');
+        resetPayButtonWithError('Please fill in all payment details correctly.');
         return;
       }
+
+      // The plan upgrade must be confirmed by the backend BEFORE we show a
+      // success screen or tell the taskpane the upgrade worked. This call
+      // requires JWT auth (same as /api/auth/me), so authToken must be
+      // included — without it the request was always rejected with 401,
+      // silently, and the database was never actually updated.
+      var payBtn     = document.getElementById('payBtn');
+      var payBtnText = document.getElementById('payBtnText');
+      var payError   = document.getElementById('payError');
+      if (payBtn) payBtn.disabled = true;
+      if (payBtnText) payBtnText.textContent = 'Processing...';
+      if (payError) payError.style.display = 'none';
+
       fetch('/api/payments/complete', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: userEmail, plan: selectedPlan })
-      }).catch(function(err) { console.error('Error completing payment:', err); });
-
-      document.getElementById('successPlan').textContent = selectedPlan;
-      showScreen('Processing');
-      setTimeout(function() { showScreen('Success'); }, 2200);
+        body: JSON.stringify({ email: userEmail, plan: selectedPlan, token: authToken })
+      })
+        .then(function(res) {
+          if (!res.ok) throw new Error('Payment could not be confirmed (status ' + res.status + ').');
+          document.getElementById('successPlan').textContent = selectedPlan;
+          showScreen('Processing');
+          setTimeout(function() { showScreen('Success'); }, 2200);
+        })
+        .catch(function(err) {
+          console.error('Error completing payment:', err);
+          resetPayButtonWithError('We could not confirm your payment: ' + err.message + '. Please try again.');
+        });
     }
 
     function verifyPayment() {
       fetch('/api/payments/complete', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: userEmail, plan: selectedPlan })
-      }).catch(function(err) { console.error('Error completing payment:', err); });
-      showScreen('Processing');
-      setTimeout(function() { showScreen('Success'); }, 2200);
+        body: JSON.stringify({ email: userEmail, plan: selectedPlan, token: authToken })
+      })
+        .then(function(res) {
+          if (!res.ok) throw new Error('Could not verify payment.');
+          showScreen('Processing');
+          setTimeout(function() { showScreen('Success'); }, 2200);
+        })
+        .catch(function(err) {
+          console.error('Error completing payment:', err);
+          resetPayButtonWithError('We could not verify your payment yet. Please try again in a moment.');
+        });
     }
 
     function finishFlow() {

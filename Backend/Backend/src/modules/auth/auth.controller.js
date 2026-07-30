@@ -660,18 +660,31 @@ class AuthController {
     }
 
     /* Send authed message to taskpane / web app and close */
+    async function saveSelectedPlan() {
+      var res = await fetch('/api/auth/update-plan', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ${token}'
+        },
+        body: JSON.stringify({ plan: selectedPlan })
+      });
+      if (!res.ok) throw new Error('update-plan responded with ' + res.status);
+    }
+
     async function finishFlow() {
       try {
-        await fetch('/api/auth/update-plan', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer ${token}'
-          },
-          body: JSON.stringify({ plan: selectedPlan })
-        });
+        await saveSelectedPlan();
       } catch (err) {
-        console.error('Failed to save plan', err);
+        console.error('Failed to save plan, retrying once:', err);
+        try {
+          await saveSelectedPlan();
+        } catch (err2) {
+          // Best-effort: still let the user into the app even if this
+          // retry also fails, but log loudly so it's visible in the
+          // backend terminal that the plan may not have persisted.
+          console.error('Failed to save plan after retry — plan may not be persisted in the database:', err2);
+        }
       }
 
       var payload = {

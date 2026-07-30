@@ -728,6 +728,7 @@ Office.onReady(() => {
                 "fa_user_email", "fa_user_name", "fa_user_provider",
                 "fa_has_subscription", "fa_subscription_id", "fa_subscription_plan",
                 "fa_erp_connected", "fa_erp_type", "fa_erp_org", "fa_erp_date",
+                "fa_current_company_id",
                 "fa_last_view", "fa_jwt_token"
             ].forEach(k => localStorage.removeItem(k));
 
@@ -1168,6 +1169,15 @@ Office.onReady(() => {
                         AppState.currentCompanyId = activeConn.companyId;
                         AppState.currentProvider = (activeConn.platform || "quickbooks").toLowerCase();
                         AppState.erpType = AppState.currentProvider;
+
+                        // Persist the resolved active company so a refresh
+                        // (which re-creates AppState from scratch) restores
+                        // the same company instead of always falling back
+                        // to the first one in the list. This is the single
+                        // point every switch path (radio button, dropdown)
+                        // routes back through via renderERPSection(), so it
+                        // covers both QuickBooks and Xero uniformly.
+                        localStorage.setItem("fa_current_company_id", activeConn.companyId || "");
 
                         const activeRealmEl = document.getElementById("activeRealmId");
                         if (activeRealmEl) activeRealmEl.textContent = activeConn.companyId || "—";
@@ -2439,7 +2449,8 @@ Office.onReady(() => {
                 AppState.subscriptionPlan = (v => (!v || v === 'null' || v === 'undefined') ? null : v)(localStorage.getItem("fa_subscription_plan"));
                 AppState.erpConnected = localStorage.getItem("fa_erp_connected") === "true";
                 AppState.erpType = localStorage.getItem("fa_erp_type");
-                
+                AppState.currentCompanyId = localStorage.getItem("fa_current_company_id") || null;
+
                 DashboardService.render();
 
                 const lastView = localStorage.getItem("fa_last_view");
@@ -2450,24 +2461,28 @@ Office.onReady(() => {
                 }
 
                 // Cached localStorage can go stale (plan changed from
-                // another device/session, or never persisted correctly in
-                // the first place). Treat the database, via /api/auth/me,
-                // as the single source of truth for the plan and correct
-                // the UI + cache if they disagree. Fire-and-forget so it
-                // never blocks the initial render.
+                // another device/session), so use /api/auth/me to pick up
+                // a newer confirmed plan. This must only ever CONFIRM or
+                // UPGRADE the displayed plan — it must never clear it back
+                // to "no plan" (which renders as Basic), since a failed
+                // request, an offline moment, or a write that simply
+                // hasn't landed yet would otherwise look exactly like the
+                // plan silently reverting to Basic on refresh.
                 if (AppState.jwtToken) {
                     ApiService.apiFetch("/api/auth/me")
                         .then(r => (r.ok ? r.json() : null))
                         .then(result => {
                             const dbPlan = result?.user?.plan || null;
-                            if (dbPlan !== AppState.subscriptionPlan) {
+                            if (dbPlan && dbPlan !== AppState.subscriptionPlan) {
                                 AppState.subscriptionPlan = dbPlan;
-                                AppState.hasSubscription = !!dbPlan;
-                                localStorage.setItem("fa_subscription_plan", dbPlan || "");
-                                localStorage.setItem("fa_has_subscription", String(!!dbPlan));
+                                AppState.hasSubscription = true;
+                                localStorage.setItem("fa_subscription_plan", dbPlan);
+                                localStorage.setItem("fa_has_subscription", "true");
                                 DashboardService.render();
                                 DashboardService.renderERPSection();
                             }
+                            // If dbPlan is empty/missing, do nothing — keep
+                            // showing whatever plan was already cached.
                         })
                         .catch(() => {
                             // Offline or request failed — keep showing the
