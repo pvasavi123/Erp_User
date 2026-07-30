@@ -66,8 +66,10 @@ class BillingService {
             throw Object.assign(new Error('User not found'), { statusCode: 404 });
         }
 
-        const oldPlan    = user.plan || 'Pro';
-        const downgraded = this.isDowngrade(oldPlan, newPlan);
+        // No prior plan means this is the user's first-ever plan
+        // selection, which can never count as a downgrade.
+        const oldPlan    = user.plan || null;
+        const downgraded = oldPlan !== null && this.isDowngrade(oldPlan, newPlan);
 
         await this.userRepository.update(userId, { plan: newPlan });
 
@@ -96,8 +98,10 @@ class BillingService {
             throw Object.assign(new Error('User not found'), { statusCode: 404 });
         }
 
-        const oldPlan    = user.plan || 'Pro';
-        const downgraded = this.isDowngrade(oldPlan, newPlan);
+        // No prior plan means this is the user's first-ever plan
+        // selection, which can never count as a downgrade.
+        const oldPlan    = user.plan || null;
+        const downgraded = oldPlan !== null && this.isDowngrade(oldPlan, newPlan);
 
         await this.userRepository.update(user.id, { plan: newPlan });
 

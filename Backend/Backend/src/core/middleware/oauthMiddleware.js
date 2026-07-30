@@ -1,14 +1,19 @@
 exports.validateQuickBooksState = (req, res, next) => {
     const { state } = req.query;
-    const storedState = req.session.oauth_state;
+    const storedState = req.session?.oauth_state;
 
-    if (storedState && state && state !== storedState) {
+    // If the session's stored state is missing, the backend session expired
+    // sometime during the OAuth redirect round-trip. Reject immediately
+    // instead of silently adopting whatever state the incoming request
+    // supplies — that adoption is a CSRF bypass.
+    if (!storedState) {
+        return res.status(400).json({ error: 'Session expired. Please reconnect.' });
+    }
+
+    if (state !== storedState) {
         return res.status(400).json({ error: "Invalid State" });
     }
 
-    if (!storedState && state) {
-        req.session.oauth_state = state;
-    }
     next();
 };
 

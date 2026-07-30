@@ -823,9 +823,13 @@ class AuthController {
                 'pro': 3
             };
 
-            const oldPlanKey = (oldPlan || 'Pro').toLowerCase();
+            // A user with no prior plan (brand-new signup) is never
+            // "downgrading" — defaulting oldPlanKey to 'Pro' here would
+            // treat their very first plan selection (Basic/Standard) as a
+            // downgrade from Pro and wipe out connections they just made.
+            const oldPlanKey = oldPlan ? oldPlan.toLowerCase() : null;
             const newPlanKey = plan.toLowerCase();
-            const isDowngrade = (planWeights[newPlanKey] || 0) < (planWeights[oldPlanKey] || 0);
+            const isDowngrade = oldPlanKey !== null && (planWeights[newPlanKey] || 0) < (planWeights[oldPlanKey] || 0);
 
             await UserRepository.update(req.user.userId, { plan });
 

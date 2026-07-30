@@ -13,6 +13,8 @@
  *  - AppController : Event binding, session restoration, init
  */
 
+import { writeRowsInBatches } from "./batchDataLoader.js";
+
 Office.onReady(() => {
 
     // ============================================================
@@ -169,13 +171,34 @@ Office.onReady(() => {
                 const err = await res.json().catch(() => ({}));
                 throw new Error(err.error || `Failed to fetch master data for company ${companyId}`);
             }
-            return await res.json();
+            const data = await res.json();
+
+            // This request/response happens entirely in the browser (fetch
+            // API running in the taskpane WebView), so the count is logged
+            // to the browser console, not a terminal.
+            const counts = {
+                company: Array.isArray(data.company) ? data.company.length : (data.company ? 1 : 0),
+                accounts: Array.isArray(data.accounts) ? data.accounts.length : 0,
+                classes: Array.isArray(data.classes) ? data.classes.length : 0,
+                locations: Array.isArray(data.locations) ? data.locations.length : 0,
+                customers: Array.isArray(data.customers) ? data.customers.length : 0,
+                vendors: Array.isArray(data.vendors) ? data.vendors.length : 0
+            };
+            const total = counts.company + counts.accounts + counts.classes + counts.locations + counts.customers + counts.vendors;
+            console.log(
+                `[FinAccrual] Master data records for company ${companyId} (${provider}): ` +
+                `accounts=${counts.accounts}, classes=${counts.classes}, locations=${counts.locations}, ` +
+                `customers=${counts.customers}, vendors=${counts.vendors}, company=${counts.company}, total=${total}`
+            );
+
+            return data;
         }
     };
 
     // ============================================================
     // 4. EXCEL SERVICE LAYER
     // ============================================================
+
     const ExcelService = {
         /**
          * Populates Excel workbook sheet "1.Master_Data" with ERP payload.
@@ -292,7 +315,9 @@ Office.onReady(() => {
                     // Section 1 (A:B) - Client Config (Client ID and Client Name SAME)
                     sheet.getRange(`A${currentRow}:B${currentRow}`).values = [[orgName, orgName]];
 
-                    // Section 2 (D:L) - Accounts
+                    // Section 2 (D:L) - Accounts, written in batches of
+                    // MASTER_DATA_WRITE_BATCH_SIZE rows so large chart-of-accounts
+                    // payloads don't sit in memory as one giant pending write.
                     if (accCount > 0) {
                         const accValues = group.accounts.map(a => [
                             orgName,
@@ -305,10 +330,10 @@ Office.onReady(() => {
                             a.active !== undefined ? (a.active ? "Active" : "Inactive") : "Active",
                             a.id || a.Id || a.AccountID || ""
                         ]);
-                        sheet.getRange(`D${currentRow}:L${currentRow + accCount - 1}`).values = accValues;
+                        await writeRowsInBatches(context, sheet, "D", "L", currentRow, accValues);
                     }
 
-                    // Section 3 (N:Q) - Classes
+                    // Section 3 (N:Q) - Classes, batched the same way.
                     if (classCount > 0) {
                         const classValues = group.classes.map(c => [
                             orgName,
@@ -316,10 +341,10 @@ Office.onReady(() => {
                             c.id || c.Id || "",
                             c.active !== undefined ? (c.active ? "Active" : "Inactive") : "Active"
                         ]);
-                        sheet.getRange(`N${currentRow}:Q${currentRow + classCount - 1}`).values = classValues;
+                        await writeRowsInBatches(context, sheet, "N", "Q", currentRow, classValues);
                     }
 
-                    // Section 4 (S:V) - Locations
+                    // Section 4 (S:V) - Locations, batched the same way.
                     if (locCount > 0) {
                         const locValues = group.locations.map(l => [
                             orgName,
@@ -327,10 +352,11 @@ Office.onReady(() => {
                             l.id || l.Id || "",
                             l.active !== undefined ? (l.active ? "Active" : "Inactive") : "Active"
                         ]);
-                        sheet.getRange(`S${currentRow}:V${currentRow + locCount - 1}`).values = locValues;
+                        await writeRowsInBatches(context, sheet, "S", "V", currentRow, locValues);
                     }
 
-                    // Section 5 (X:AB) - Entities
+                    // Section 5 (X:AB) - Entities (Customers + Vendors), the
+                    // section most likely to be large, batched the same way.
                     if (entityCount > 0) {
                         const entityValues = group.entities.map(e => [
                             orgName,
@@ -339,7 +365,7 @@ Office.onReady(() => {
                             e.id,
                             e.status
                         ]);
-                        sheet.getRange(`X${currentRow}:AB${currentRow + entityCount - 1}`).values = entityValues;
+                        await writeRowsInBatches(context, sheet, "X", "AB", currentRow, entityValues);
                     }
 
                     // Advance currentRow by maxRows + 2 (providing 2 empty row spaces between organizations!)
@@ -1240,10 +1266,11 @@ Office.onReady(() => {
                     const sectionTitle = document.querySelector(".fa-section-title");
                     if (sectionTitle) sectionTitle.textContent = `${platformDisplayName} Companies`;
 
-                    // Update header status realm label
+                    // Update header status realm label (kept beside the ID
+                    // itself, not as a separate label elsewhere in the row)
                     const connStatus = document.querySelector(".fa-conn-status");
                     if (connStatus && activeConn) {
-                        connStatus.innerHTML = `Connected – ${platformDisplayName}: <span id="connRealmId">${activeConn.companyId || "—"}</span>`;
+                        connStatus.innerHTML = `<span class="fa-realm-label">Realm ID:</span> <span id="connRealmId">${activeConn.companyId || "—"}</span>`;
                     }
 
                     // Update Disconnect button label
@@ -2186,8 +2213,26 @@ Office.onReady(() => {
                     DashboardService.renderERPSection();
                 } catch (error) {
                     console.error(error);
-                    DashboardService.addLog("Error pulling data: " + error.message);
-                    DashboardService.showStatus("Error pulling data.", "error");
+                    const isExpired = error.message && error.message.toLowerCase().includes("session has expired");
+                    const msg = isExpired
+                        ? error.message
+                        : "Error pulling data: " + error.message;
+                    DashboardService.addLog(msg);
+                    DashboardService.showStatus(isExpired ? "Session expired. Please reconnect." : "Error pulling data.", "error");
+                    if (isExpired) {
+                        // renderERPConsole() only toggles a progress-step
+                        // marker — it doesn't touch the company badge. To
+                        // actually flip ACTIVE -> Reconnect in the UI, we
+                        // need to re-fetch connections and re-render the
+                        // company list, which is what renderERPSection()
+                        // does. Guarded in case of an unexpected error, so
+                        // it can't surface as an uncaught runtime popup.
+                        try {
+                            DashboardService.renderERPSection();
+                        } catch (renderErr) {
+                            console.error("Failed to refresh ERP section after session expiry:", renderErr);
+                        }
+                    }
                 }
             });
 
@@ -2234,8 +2279,26 @@ Office.onReady(() => {
                     DashboardService.renderERPSection();
                 } catch (error) {
                     console.error(error);
-                    DashboardService.addLog("Error pulling data: " + error.message);
-                    DashboardService.showStatus("Error pulling data.", "error");
+                    const isExpired = error.message && error.message.toLowerCase().includes("session has expired");
+                    const msg = isExpired
+                        ? error.message
+                        : "Error pulling data: " + error.message;
+                    DashboardService.addLog(msg);
+                    DashboardService.showStatus(isExpired ? "Session expired. Please reconnect." : "Error pulling data.", "error");
+                    if (isExpired) {
+                        // renderERPConsole() only toggles a progress-step
+                        // marker — it doesn't touch the company badge. To
+                        // actually flip ACTIVE -> Reconnect in the UI, we
+                        // need to re-fetch connections and re-render the
+                        // company list, which is what renderERPSection()
+                        // does. Guarded in case of an unexpected error, so
+                        // it can't surface as an uncaught runtime popup.
+                        try {
+                            DashboardService.renderERPSection();
+                        } catch (renderErr) {
+                            console.error("Failed to refresh ERP section after session expiry:", renderErr);
+                        }
+                    }
                 }
             });
 
@@ -2384,6 +2447,32 @@ Office.onReady(() => {
                     ViewRouter.show(lastView);
                 } else {
                     ViewRouter.show("Dashboard");
+                }
+
+                // Cached localStorage can go stale (plan changed from
+                // another device/session, or never persisted correctly in
+                // the first place). Treat the database, via /api/auth/me,
+                // as the single source of truth for the plan and correct
+                // the UI + cache if they disagree. Fire-and-forget so it
+                // never blocks the initial render.
+                if (AppState.jwtToken) {
+                    ApiService.apiFetch("/api/auth/me")
+                        .then(r => (r.ok ? r.json() : null))
+                        .then(result => {
+                            const dbPlan = result?.user?.plan || null;
+                            if (dbPlan !== AppState.subscriptionPlan) {
+                                AppState.subscriptionPlan = dbPlan;
+                                AppState.hasSubscription = !!dbPlan;
+                                localStorage.setItem("fa_subscription_plan", dbPlan || "");
+                                localStorage.setItem("fa_has_subscription", String(!!dbPlan));
+                                DashboardService.render();
+                                DashboardService.renderERPSection();
+                            }
+                        })
+                        .catch(() => {
+                            // Offline or request failed — keep showing the
+                            // cached plan rather than blocking the UI.
+                        });
                 }
             } else {
                 // Reset AppState to defaults

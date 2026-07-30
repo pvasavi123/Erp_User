@@ -47,14 +47,27 @@ class QuickBooksService {
 
         const tokenData = response.data;
 
-        // Immediately fetch CompanyInfo using the new token
-        const tempToken = {
-            realm_id: realmId,
-            access_token: tokenData.access_token
-        };
-        const rawComp = await QuickBooksService.executeQuery('SELECT * FROM CompanyInfo', tempToken);
-        const compInfo = QuickBooksMapper.toCompanyInfo(rawComp);
-        const companyName = compInfo ? (compInfo.name || compInfo.legalName || realmId) : 'QuickBooks Company';
+        // Fetch CompanyInfo using the newly issued access token directly,
+        // via a raw request rather than executeQuery/QuickBooksTokenManager.
+        // Those look up whatever token is already stored for this realmId,
+        // which — on a reconnect — can be a stale/expired one, causing this
+        // step to fail with a 401 immediately after a successful exchange.
+        let companyName = 'QuickBooks Company';
+        try {
+            const url = `${CONSTANTS.QUICKBOOKS.BASE_URL}/v3/company/${realmId}/query`;
+            const compRes = await axios.get(url, {
+                headers: {
+                    Authorization: `Bearer ${tokenData.access_token}`,
+                    Accept: 'application/json',
+                    'Content-Type': 'application/text'
+                },
+                params: { query: 'SELECT * FROM CompanyInfo' }
+            });
+            const compInfo = QuickBooksMapper.toCompanyInfo(compRes.data);
+            companyName = compInfo ? (compInfo.name || compInfo.legalName || realmId) : 'QuickBooks Company';
+        } catch (compErr) {
+            logger.warn(`Could not fetch company info directly during OAuth exchange for realm ${realmId}:`, compErr.message);
+        }
 
         await QuickBooksTokenRepository.upsertToken({
             realm_id: realmId,
@@ -118,6 +131,40 @@ class QuickBooksService {
     }
 
     /**
+     * Fetches every record of `entityName` for a token, paging through
+     * STARTPOSITION/MAXRESULTS until QuickBooks returns fewer than
+     * `batchSize` records.
+     *
+     * QuickBooks' query API defaults to only the first 100 records when
+     * MAXRESULTS is omitted, and caps MAXRESULTS at 1000 per request, so
+     * any entity type with more records than that gets silently truncated
+     * unless paged through like this. Returns a QueryResponse-shaped
+     * object so existing QuickBooksMapper.toXList() calls work unchanged.
+     *
+     * @param {string} entityName - QBQL entity name, e.g. "Customer".
+     * @param {object} token
+     * @param {number} [batchSize=1000] - QuickBooks' MAXRESULTS hard cap.
+     * @returns {Promise<{ QueryResponse: Object }>}
+     */
+    static async queryAll(entityName, token, batchSize = 1000) {
+        const allRecords = [];
+        let startPosition = 1;
+
+        while (true) {
+            const query = `SELECT * FROM ${entityName} STARTPOSITION ${startPosition} MAXRESULTS ${batchSize}`;
+            const raw = await QuickBooksService.executeQuery(query, token);
+            const batch = raw?.QueryResponse?.[entityName] || [];
+
+            allRecords.push(...batch);
+
+            if (batch.length < batchSize) break;
+            startPosition += batchSize;
+        }
+
+        return { QueryResponse: { [entityName]: allRecords } };
+    }
+
+    /**
      * Fetch company info and return clean CompanyDTO for a specific token or all tokens.
      * @param {object} [token]
      * @returns {CompanyDTO|CompanyDTO[]|null}
@@ -172,7 +219,7 @@ class QuickBooksService {
 
         for (const token of tokens) {
             try {
-                const raw = await QuickBooksService.executeQuery('SELECT * FROM Customer', token);
+                const raw = await QuickBooksService.queryAll('Customer', token);
                 const list = QuickBooksMapper.toCustomerList(raw);
                 const { orgId, orgName } = await QuickBooksService.getCompanyMetadata(token);
                 for (const c of list) {
@@ -198,7 +245,7 @@ class QuickBooksService {
 
         for (const token of tokens) {
             try {
-                const raw = await QuickBooksService.executeQuery('SELECT * FROM Vendor', token);
+                const raw = await QuickBooksService.queryAll('Vendor', token);
                 const list = QuickBooksMapper.toVendorList(raw);
                 const { orgId, orgName } = await QuickBooksService.getCompanyMetadata(token);
                 for (const v of list) {
@@ -224,7 +271,7 @@ class QuickBooksService {
 
         for (const token of tokens) {
             try {
-                const raw = await QuickBooksService.executeQuery('SELECT * FROM Account', token);
+                const raw = await QuickBooksService.queryAll('Account', token);
                 const list = QuickBooksMapper.toAccountList(raw);
                 const { orgId, orgName } = await QuickBooksService.getCompanyMetadata(token);
                 for (const a of list) {
@@ -250,7 +297,7 @@ class QuickBooksService {
 
         for (const token of tokens) {
             try {
-                const raw = await QuickBooksService.executeQuery('SELECT * FROM Class', token);
+                const raw = await QuickBooksService.queryAll('Class', token);
                 const list = QuickBooksMapper.toClassList(raw);
                 const { orgId, orgName } = await QuickBooksService.getCompanyMetadata(token);
                 for (const c of list) {
@@ -276,7 +323,7 @@ class QuickBooksService {
 
         for (const token of tokens) {
             try {
-                const raw = await QuickBooksService.executeQuery('SELECT * FROM Department', token);
+                const raw = await QuickBooksService.queryAll('Department', token);
                 const list = QuickBooksMapper.toLocationList(raw);
                 const { orgId, orgName } = await QuickBooksService.getCompanyMetadata(token);
                 for (const l of list) {
@@ -390,11 +437,11 @@ class QuickBooksService {
                 }
 
                 const [rawCust, rawVend, rawAcc, rawClass, rawLoc] = await Promise.all([
-                    QuickBooksService.executeQuery('SELECT * FROM Customer', token),
-                    QuickBooksService.executeQuery('SELECT * FROM Vendor', token),
-                    QuickBooksService.executeQuery('SELECT * FROM Account', token),
-                    QuickBooksService.executeQuery('SELECT * FROM Class', token),
-                    QuickBooksService.executeQuery('SELECT * FROM Department', token)
+                    QuickBooksService.queryAll('Customer', token),
+                    QuickBooksService.queryAll('Vendor', token),
+                    QuickBooksService.queryAll('Account', token),
+                    QuickBooksService.queryAll('Class', token),
+                    QuickBooksService.queryAll('Department', token)
                 ]);
 
                 const orgName = comp?.name || comp?.legalName || token.companyName;
@@ -407,11 +454,25 @@ class QuickBooksService {
                 aggregated.locations.push(...tag(QuickBooksMapper.toLocationList(rawLoc)));
 
                 await QuickBooksToken.update(
-                    { last_synced_at: new Date() },
+                    { last_synced_at: new Date(), status: 'Active' },
                     { where: { realm_id: token.companyId } }
                 );
             } catch (err) {
                 logger.error(`Error pulling QB data for connection ${token.companyId}:`, err.message);
+
+                const isTokenError = err.response?.status === 401
+                    || err.statusCode === 401
+                    || (err.message && (err.message.includes('Token expired') || err.message.includes('401') || err.message.includes('grant')));
+
+                if (isTokenError || err.message?.includes('OAuth')) {
+                    await QuickBooksToken.update(
+                        { status: 'Disconnected' },
+                        { where: { realm_id: token.companyId } }
+                    );
+                    throw new Error(`Your session has expired for company "${token.companyName}". Please reconnect to the company again and continue your process.`);
+                }
+
+                throw err;
             }
         }
 

@@ -234,6 +234,21 @@ router.post('/pull-master-data', authenticate, async (req, res) => {
             return res.status(404).json({ error: `No active connections found for ${platform}.` });
         }
 
+        // This runs on the backend Node process, so this log shows up in
+        // the server's terminal (not the browser console).
+        const companyName = aggregated.company.length === 1
+            ? (aggregated.company[0].name || aggregated.company[0].companyName || companyId)
+            : aggregated.company.map(c => c.name || c.companyName).join(', ');
+
+        console.log(
+            `Company: ${companyName}\n` +
+            `Accounts: ${aggregated.accounts.length}\n` +
+            `Customers: ${aggregated.customers.length}\n` +
+            `Vendors: ${aggregated.vendors.length}\n` +
+            `Classes: ${aggregated.classes.length}\n` +
+            `Locations: ${aggregated.locations.length}`
+        );
+
         return res.json({
             company:   aggregated.company.length === 1 ? aggregated.company[0] : aggregated.company,
             customers: aggregated.customers,
