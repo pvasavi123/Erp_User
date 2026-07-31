@@ -1,3 +1,5 @@
+const { ValidationError } = require('../errors/AppError');
+
 exports.validateQuickBooksState = (req, res, next) => {
     const { state } = req.query;
     const storedState = req.session?.oauth_state;
@@ -7,11 +9,11 @@ exports.validateQuickBooksState = (req, res, next) => {
     // instead of silently adopting whatever state the incoming request
     // supplies — that adoption is a CSRF bypass.
     if (!storedState) {
-        return res.status(400).json({ error: 'Session expired. Please reconnect.' });
+        return next(new ValidationError('Session expired. Please reconnect QuickBooks.'));
     }
 
     if (state !== storedState) {
-        return res.status(400).json({ error: "Invalid State" });
+        return next(new ValidationError('Invalid OAuth state parameter.'));
     }
 
     next();
@@ -21,11 +23,11 @@ exports.validateXeroState = (req, res, next) => {
     const { code, state } = req.query;
 
     if (!code) {
-        return res.status(400).json({ error: "Authorization code not received from Xero." });
+        return next(new ValidationError('Authorization code not received from Xero.'));
     }
 
     if (state !== req.session.xero_state) {
-        return res.status(400).json({ error: "Invalid state parameter." });
+        return next(new ValidationError('Invalid OAuth state parameter.'));
     }
     next();
 };

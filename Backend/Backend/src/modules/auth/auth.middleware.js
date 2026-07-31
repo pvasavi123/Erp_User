@@ -2,13 +2,17 @@
 
 const JwtService     = require('./jwt.service');
 const UserRepository = require('./user.repository');
+const { SessionExpiredError } = require('../../core/errors/AppError');
 
 /**
  * authenticate middleware
  * ----------------------------------------------------------------
  * Verifies the Bearer JWT on protected routes.
  * On success: populates req.user with the decoded payload.
- * On failure: 401 Unauthorized.
+ * On failure: forwards a SessionExpiredError (401, ERR_SESSION_EXPIRED)
+ * to the centralized error middleware — every failure mode here (missing
+ * token, malformed token, expired token, deactivated user) is the same
+ * "please sign in again" scenario from the frontend's point of view.
  *
  * Usage:
  *   const { authenticate } = require('./auth.middleware');
@@ -36,10 +40,7 @@ const authenticate = async (req, res, next) => {
         }
 
         if (!token) {
-            return res.status(401).json({
-                success: false,
-                message: 'Unauthorized: Missing or malformed authentication token'
-            });
+            return next(new SessionExpiredError('Missing or malformed authentication token.'));
         }
 
         const decoded = JwtService.verifyToken(token);
@@ -47,10 +48,7 @@ const authenticate = async (req, res, next) => {
         // Optionally load the full user record so downstream handlers have it
         const user = await UserRepository.findById(decoded.userId);
         if (!user || !user.is_active) {
-            return res.status(401).json({
-                success: false,
-                message: 'Unauthorized: User not found or deactivated'
-            });
+            return next(new SessionExpiredError('User not found or deactivated.'));
         }
 
         req.user = {
@@ -62,10 +60,7 @@ const authenticate = async (req, res, next) => {
 
         next();
     } catch (err) {
-        return res.status(401).json({
-            success: false,
-            message: 'Unauthorized: Invalid or expired token'
-        });
+        return next(new SessionExpiredError(err.message || 'JWT verification failed.'));
     }
 };
 

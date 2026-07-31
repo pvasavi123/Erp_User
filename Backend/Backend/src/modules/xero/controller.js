@@ -7,6 +7,7 @@ const logger      = require('../../core/logger');
 const { generateOAuthState } = require('../../core/helpers');
 const XeroService         = require('./service');
 const XeroTokenRepository = require('./repository');
+const { ValidationError } = require('../../core/errors/AppError');
 
 /**
  * XeroController
@@ -23,7 +24,7 @@ class XeroController {
      * GET /api/xero/connect
      * Generates the Xero OAuth authorization URL and redirects.
      */
-    connectXero = async (req, res) => {
+    connectXero = async (req, res, next) => {
         try {
             const { XeroToken } = require('../../core/database');
             const mail = req.query.mail || req.session?.user_mail || req.session?.admin?.email || req.session?.googleUser?.email || null;
@@ -69,8 +70,7 @@ class XeroController {
             logger.info('Redirecting to Xero OAuth... URL: ' + authUrl);
             res.redirect(authUrl);
         } catch (error) {
-            logger.error('Error generating Xero OAuth URL', error);
-            res.status(500).json({ error: 'Failed to generate authorization url' });
+            next(error);
         }
     };
 
@@ -80,7 +80,7 @@ class XeroController {
      * stores tokens temporarily in the session, then returns a company-selection
      * HTML page so the user can choose which orgs to activate.
      */
-    xeroCallback = async (req, res) => {
+    xeroCallback = async (req, res, next) => {
         try {
             const { code } = req.query;
             const mail        = req.session?.user_mail || req.session?.admin?.email || req.session?.googleUser?.email || null;
@@ -479,7 +479,9 @@ class XeroController {
 
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        throw new Error(err.error || 'Failed to save companies.');
+        // Standardized backend error envelope uses "message"; keep the
+        // "error" fallback for backwards compatibility with old responses.
+        throw new Error(err.message || err.error || 'Failed to save companies.');
       }
 
       // Notify parent window and close (mirrors existing SUCCESS_HTML pattern)
@@ -503,11 +505,8 @@ class XeroController {
 </body>
 </html>`);
         } catch (err) {
-            logger.error('Xero OAuth Error', err.response?.data || err.message);
-            return res.status(500).json({
-                success: false,
-                error:   err.response?.data || err.message
-            });
+            const details = JSON.stringify(err.response?.data || err.message);
+            next(new ValidationError('Failed to connect Xero. Please try again.', details));
         }
     };
 
@@ -516,12 +515,12 @@ class XeroController {
      * Receives the user's chosen tenant IDs (from the selection page),
      * reads the pending tokens from session, and persists only the chosen orgs.
      */
-    selectCompanies = async (req, res) => {
+    selectCompanies = async (req, res, next) => {
         try {
             const { selectedTenantIds } = req.body;
 
             if (!selectedTenantIds || !Array.isArray(selectedTenantIds) || selectedTenantIds.length === 0) {
-                return res.status(400).json({ success: false, error: 'No companies selected.' });
+                throw new ValidationError('No companies selected.');
             }
 
             // Read pending data from session
@@ -531,7 +530,7 @@ class XeroController {
             const sessionInfo = JSON.stringify(req.session || {});
 
             if (!tokens || !tenants) {
-                return res.status(400).json({ success: false, error: 'Session expired. Please reconnect Xero.' });
+                throw new ValidationError('Session expired. Please reconnect Xero.');
             }
 
             const { XeroToken } = require('../../core/database');
@@ -547,10 +546,9 @@ class XeroController {
 
             const maxAllowed = req.session?.xero_max_allowed || 10;
             if (otherCount + selectedTenantIds.length > maxAllowed) {
-                return res.status(400).json({ 
-                    success: false, 
-                    error: `Your plan allows a maximum of ${maxAllowed} Xero companies. You currently have ${otherCount} connected companies and selected ${selectedTenantIds.length} more.` 
-                });
+                throw new ValidationError(
+                    `Your plan allows a maximum of ${maxAllowed} Xero companies. You currently have ${otherCount} connected companies and selected ${selectedTenantIds.length} more.`
+                );
             }
 
             await XeroService.saveSelectedTenants(selectedTenantIds, tokens, tenants, mail, sessionInfo);
@@ -562,8 +560,7 @@ class XeroController {
 
             return res.json({ success: true, connected: selectedTenantIds.length });
         } catch (err) {
-            logger.error('Xero selectCompanies error', err.message);
-            return res.status(500).json({ success: false, error: err.message });
+            next(err);
         }
     };
 
@@ -571,12 +568,12 @@ class XeroController {
      * POST /api/xero/disconnect
      * Clears all stored Xero tokens.
      */
-    disconnectXero = async (req, res) => {
+    disconnectXero = async (req, res, next) => {
         try {
             await XeroTokenRepository.clearTokens();
             res.json({ success: true, message: 'Xero tokens cleared successfully.' });
         } catch (error) {
-            res.status(500).json({ success: false, error: error.message });
+            next(error);
         }
     };
 
@@ -584,12 +581,12 @@ class XeroController {
      * GET /api/xero/tokens
      * Returns all stored Xero OAuth tokens (for debugging).
      */
-    listXeroTokens = async (req, res) => {
+    listXeroTokens = async (req, res, next) => {
         try {
             const tokens = await XeroTokenRepository.getAllTokens();
             res.json({ success: true, tokens });
         } catch (err) {
-            res.status(500).json({ success: false, error: err.message });
+            next(err);
         }
     };
 
@@ -597,13 +594,12 @@ class XeroController {
      * GET /api/xero/contacts
      * Returns a list of mapped ContactDTOs.
      */
-    getContacts = async (req, res) => {
+    getContacts = async (req, res, next) => {
         try {
             const contacts = await XeroService.getContacts();
             res.json({ contacts });
         } catch (err) {
-            logger.error('Xero getContacts error:', err.message);
-            res.status(500).json({ error: err.message });
+            next(err);
         }
     };
 
@@ -611,12 +607,12 @@ class XeroController {
      * GET /api/xero/accounts
      * Returns a list of mapped AccountDTOs.
      */
-    getAccounts = async (req, res) => {
+    getAccounts = async (req, res, next) => {
         try {
             const accounts = await XeroService.getAccounts();
             res.json({ accounts });
         } catch (err) {
-            res.status(500).json({ error: err.message });
+            next(err);
         }
     };
 
@@ -624,12 +620,12 @@ class XeroController {
      * GET /api/xero/classes
      * Returns a list of mapped ClassDTOs.
      */
-    getClasses = async (req, res) => {
+    getClasses = async (req, res, next) => {
         try {
             const classes = await XeroService.getClasses();
             res.json({ classes });
         } catch (err) {
-            res.status(500).json({ error: err.message });
+            next(err);
         }
     };
 
@@ -637,12 +633,12 @@ class XeroController {
      * GET /api/xero/locations
      * Returns a list of mapped LocationDTOs.
      */
-    getLocations = async (req, res) => {
+    getLocations = async (req, res, next) => {
         try {
             const locations = await XeroService.getLocations();
             res.json({ locations });
         } catch (err) {
-            res.status(500).json({ error: err.message });
+            next(err);
         }
     };
 
@@ -650,12 +646,12 @@ class XeroController {
      * GET /api/xero/organisation
      * Returns organisation info.
      */
-    getOrganisation = async (req, res) => {
+    getOrganisation = async (req, res, next) => {
         try {
             const organisation = await XeroService.getOrganisation();
             res.json({ organisation });
         } catch (err) {
-            res.status(500).json({ error: err.message });
+            next(err);
         }
     };
 }

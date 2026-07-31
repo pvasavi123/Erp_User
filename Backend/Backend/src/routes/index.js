@@ -15,6 +15,7 @@
 
 const express = require('express');
 const router  = express.Router();
+const { ValidationError, NotFoundError } = require('../core/errors/AppError');
 
 // ── Core domain modules ───────────────────────────────────────────
 const authRoutes        = require('../modules/auth/auth.routes');
@@ -66,7 +67,7 @@ const { authenticate } = require('../modules/auth/auth.middleware');
 // ── Dynamic Connections Routes ────────────────────────────────────
 
 // GET /api/connections
-router.get('/connections', authenticate, async (req, res) => {
+router.get('/connections', authenticate, async (req, res, next) => {
     try {
         const mail = req.query.mail
             || req.session?.user_mail
@@ -90,12 +91,12 @@ router.get('/connections', authenticate, async (req, res) => {
 
         return res.json(list);
     } catch (err) {
-        return res.status(500).json({ error: err.message });
+        return next(err);
     }
 });
 
 // GET /api/connections/stats
-router.get('/connections/stats', authenticate, async (req, res) => {
+router.get('/connections/stats', authenticate, async (req, res, next) => {
     try {
         const mail = req.query.mail || req.session?.user_mail || null;
         const plan = req.query.plan || 'pro';
@@ -130,12 +131,12 @@ router.get('/connections/stats', authenticate, async (req, res) => {
 
         return res.json(stats);
     } catch (err) {
-        return res.status(500).json({ error: err.message });
+        return next(err);
     }
 });
 
 // DELETE /api/connections/:id
-router.delete('/connections/:id', authenticate, async (req, res) => {
+router.delete('/connections/:id', authenticate, async (req, res, next) => {
     try {
         const companyId = req.params.id;
         let success = false;
@@ -154,12 +155,12 @@ router.delete('/connections/:id', authenticate, async (req, res) => {
 
         return res.json({ success });
     } catch (err) {
-        return res.status(500).json({ error: err.message });
+        return next(err);
     }
 });
 
 // POST /api/connections/:id/activate
-router.post('/connections/:id/activate', authenticate, async (req, res) => {
+router.post('/connections/:id/activate', authenticate, async (req, res, next) => {
     try {
         const companyId = req.params.id;
         let success = false;
@@ -178,17 +179,17 @@ router.post('/connections/:id/activate', authenticate, async (req, res) => {
 
         return res.json({ success });
     } catch (err) {
-        return res.status(500).json({ error: err.message });
+        return next(err);
     }
 });
 
 // PATCH /api/connections/:id/rename
-router.patch('/connections/:id/rename', authenticate, async (req, res) => {
+router.patch('/connections/:id/rename', authenticate, async (req, res, next) => {
     try {
         const companyId = req.params.id;
         const { companyName } = req.body;
         if (!companyName) {
-            return res.status(400).json({ error: 'companyName is required' });
+            throw new ValidationError('companyName is required.');
         }
 
         let success = false;
@@ -207,16 +208,18 @@ router.patch('/connections/:id/rename', authenticate, async (req, res) => {
 
         return res.json({ success });
     } catch (err) {
-        return res.status(500).json({ error: err.message });
+        return next(err);
     }
 });
 
-// POST /api/pull-master-data
-router.post('/pull-master-data', authenticate, async (req, res) => {
+// GET /api/pull-master-data?companyId=...&platform=...&tier=...
+// A read — fetches the current data from QuickBooks/Xero — so GET with
+// query params rather than POST with a body.
+router.get('/pull-master-data', authenticate, async (req, res, next) => {
     try {
-        const { companyId, platform, tier } = req.body;
+        const { companyId, platform, tier } = req.query;
         if (!platform) {
-            return res.status(400).json({ error: 'Missing platform.' });
+            throw new ValidationError('Missing platform.');
         }
 
         const normPlatform = platform.toLowerCase();
@@ -231,7 +234,7 @@ router.post('/pull-master-data', authenticate, async (req, res) => {
         }
 
         if (!aggregated) {
-            return res.status(404).json({ error: `No active connections found for ${platform}.` });
+            throw new NotFoundError(`No active connections found for ${platform}.`);
         }
 
         // This runs on the backend Node process, so this log shows up in
@@ -258,7 +261,7 @@ router.post('/pull-master-data', authenticate, async (req, res) => {
             locations: aggregated.locations
         });
     } catch (err) {
-        return res.status(500).json({ error: err.message });
+        return next(err);
     }
 });
 

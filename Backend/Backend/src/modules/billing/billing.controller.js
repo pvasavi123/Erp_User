@@ -3,6 +3,7 @@
 const BillingService     = require('./billing.service');
 const UserRepository     = require('../auth/user.repository');
 const logger             = require('../../core/logger');
+const { ValidationError } = require('../../core/errors/AppError');
 
 /**
  * BillingController
@@ -29,11 +30,11 @@ class BillingController {
     // POST /api/subscription/upgrade
     // Requires JWT authentication (enforced by router middleware).
     // ----------------------------------------------------------------
-    upgrade = async (req, res) => {
+    upgrade = async (req, res, next) => {
         try {
             const { plan } = req.body;
             if (!plan) {
-                return res.status(400).json({ success: false, message: 'Missing plan.' });
+                throw new ValidationError('Missing plan.');
             }
 
             const result = await this.billingService.upgradePlanById(req.user.userId, plan);
@@ -46,9 +47,7 @@ class BillingController {
 
             return res.json({ success: true, message: 'Plan updated successfully.', ...result });
         } catch (error) {
-            const statusCode = error.statusCode || 500;
-            logger.error('[Billing] upgrade error:', error.message);
-            return res.status(statusCode).json({ success: false, message: error.message || 'Internal server error.' });
+            next(error);
         }
     };
 
@@ -56,11 +55,11 @@ class BillingController {
     // POST /api/payments/complete
     // Called by the checkout popup after the mock payment succeeds.
     // ----------------------------------------------------------------
-    completePayment = async (req, res) => {
+    completePayment = async (req, res, next) => {
         try {
             const { email, plan } = req.body;
             if (!email || !plan) {
-                return res.status(400).json({ success: false, message: 'Email and plan are required.' });
+                throw new ValidationError('Email and plan are required.');
             }
 
             const result = await this.billingService.upgradePlanByEmail(email, plan);
@@ -73,9 +72,7 @@ class BillingController {
 
             return res.json({ success: true, message: 'Plan updated successfully.', ...result });
         } catch (error) {
-            const statusCode = error.statusCode || 500;
-            logger.error('[Billing] completePayment error:', error.message);
-            return res.status(statusCode).json({ success: false, message: error.message || 'Internal server error.' });
+            next(error);
         }
     };
 

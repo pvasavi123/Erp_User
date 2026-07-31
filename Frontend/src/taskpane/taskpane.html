@@ -14,6 +14,20 @@
     <div class="app" id="app">
 
       <!-- ============================================================
+           GLOBAL ERROR HANDLING UI
+           Populated/controlled by shared/apiErrorHandler.js. Sits above
+           every view so it's visible no matter what screen is active.
+           ============================================================ -->
+      <div id="faGlobalBanner" class="fa-global-banner" role="alert" style="display:none;">
+        <span class="fa-global-banner-icon" id="faGlobalBannerIcon">⚠️</span>
+        <span class="fa-global-banner-message" id="faGlobalBannerMessage"></span>
+        <button class="fa-global-banner-action" id="faGlobalBannerAction" style="display:none;"></button>
+        <button class="fa-global-banner-dismiss" id="faGlobalBannerDismiss" aria-label="Dismiss">✕</button>
+      </div>
+
+      <div id="faToast" class="fa-toast" style="display:none;"></div>
+
+      <!-- ============================================================
            VIEW: LOADING
            ============================================================ -->
       <div id="viewLoading" class="view active">

@@ -9,6 +9,15 @@ const XeroTokenRepository = require('./repository');
 const XeroMapper  = require('./mapper');
 const logger      = require('../../core/logger');
 const XeroTokenManager = require('./oauth/XeroTokenManager');
+const { ErpSessionExpiredError } = require('../../core/errors/AppError');
+
+/** True if an axios error looks like an expired/revoked OAuth grant. */
+function isAuthError(err) {
+    if (!err) return false;
+    if (err.response?.status === 401 || err.response?.status === 403) return true;
+    const blob = JSON.stringify(err.response?.data || err.message || '').toLowerCase();
+    return blob.includes('invalid_grant') || blob.includes('invalid_token') || blob.includes('unauthorized');
+}
 
 /**
  * XeroService
@@ -462,11 +471,21 @@ class XeroService {
                             const config = require('../../core/config');
                             const credentials = encodeBasicAuth(config.XERO.CLIENT_ID, config.XERO.CLIENT_SECRET);
 
-                            const refreshRes = await axios.post(
-                                CONSTANTS.XERO.TOKEN_URL,
-                                new URLSearchParams({ grant_type: 'refresh_token', refresh_token: token.refreshToken }),
-                                { headers: { Authorization: `Basic ${credentials}`, 'Content-Type': 'application/x-www-form-urlencoded' } }
-                            );
+                            let refreshRes;
+                            try {
+                                refreshRes = await axios.post(
+                                    CONSTANTS.XERO.TOKEN_URL,
+                                    new URLSearchParams({ grant_type: 'refresh_token', refresh_token: token.refreshToken }),
+                                    { headers: { Authorization: `Basic ${credentials}`, 'Content-Type': 'application/x-www-form-urlencoded' } }
+                                );
+                            } catch (refreshErr) {
+                                // The refresh call itself failing (invalid_grant, etc.)
+                                // means the connection is truly dead — tag it so the
+                                // outer catch can distinguish this from an unrelated
+                                // per-endpoint hiccup and surface ERR_ERP_SESSION_EXPIRED.
+                                refreshErr.isXeroAuthFailure = true;
+                                throw refreshErr;
+                            }
 
                             token.accessToken  = refreshRes.data.access_token;
                             token.refreshToken = refreshRes.data.refresh_token;
@@ -483,8 +502,40 @@ class XeroService {
                     }
                 };
 
-                const [orgRes, contactRes, accRes, classRes] = await Promise.all([
-                    xeroGet(CONSTANTS.XERO.ORGANISATION_URL).catch(() => null),
+                // Fetch organisation first, un-swallowed, so a dead connection
+                // (refresh token expired/revoked, OR the backend simply can't
+                // reach Xero at all — no internet, DNS failure, Xero outage)
+                // surfaces as a real failure instead of silently producing an
+                // all-empty "success". The other three calls stay best-effort
+                // so one bad endpoint doesn't sink an otherwise-successful pull.
+                const orgSettled = await Promise.allSettled([xeroGet(CONSTANTS.XERO.ORGANISATION_URL)]);
+                if (orgSettled[0].status === 'rejected') {
+                    const reason = orgSettled[0].reason;
+
+                    if (reason?.isXeroAuthFailure || isAuthError(reason)) {
+                        await XeroToken.update(
+                            { status: 'Disconnected' },
+                            { where: { tenant_id: token.companyId } }
+                        );
+                        throw new ErpSessionExpiredError(
+                            'Xero',
+                            `Xero refresh token expired/revoked for company "${token.companyName}" (${token.companyId}): ${reason?.message}`
+                        );
+                    }
+
+                    // Not an auth problem (e.g. ENOTFOUND/ECONNREFUSED/ETIMEDOUT
+                    // reaching Xero, or a Xero-side outage) — rethrow so it
+                    // reaches the centralized error middleware, which
+                    // recognizes raw network error codes and reports
+                    // ERR_CONNECTION_REFUSED (503) instead of silently
+                    // pretending the pull succeeded with no data. This
+                    // mirrors QuickBooksService.pullMasterData's `throw err;`
+                    // fallback for the same class of failure.
+                    throw reason;
+                }
+                const orgRes = orgSettled[0].value;
+
+                const [contactRes, accRes, classRes] = await Promise.all([
                     xeroGet(CONSTANTS.XERO.CONTACTS_URL).catch(() => null),
                     xeroGet(CONSTANTS.XERO.ACCOUNTS_URL).catch(() => null),
                     xeroGet(CONSTANTS.XERO.TRACKING_CATEGORIES_URL).catch(() => null)
@@ -514,6 +565,11 @@ class XeroService {
                 );
             } catch (err) {
                 logger.error(`Error pulling Xero data for connection ${token.companyId}:`, err.message);
+                // Propagate (matches QuickBooksService.pullMasterData) so the
+                // controller/error middleware sees the real failure — including
+                // ErpSessionExpiredError thrown above — instead of silently
+                // returning an empty result set.
+                throw err;
             }
         }
 

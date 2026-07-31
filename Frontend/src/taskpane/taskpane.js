@@ -14,6 +14,16 @@
  */
 
 import { writeRowsInBatches } from "./batchDataLoader.js";
+import {
+    ERROR_CODES,
+    ApiError,
+    parseApiError,
+    networkError,
+    showBanner,
+    hideBanner,
+    showToast
+} from "../shared/apiErrorHandler.js";
+import { getFriendlyMessage } from "../shared/errorMessages.js";
 
 Office.onReady(() => {
 
@@ -43,6 +53,12 @@ Office.onReady(() => {
 
         // JWT token — persisted across sessions
         jwtToken:         localStorage.getItem("fa_jwt_token") || null,
+
+        // Set true the moment the backend reports ERR_SESSION_EXPIRED.
+        // While true, ApiService.apiFetch refuses to make further requests
+        // (avoids hammering the backend with a storm of repeated 401s)
+        // until a fresh token is obtained via login.
+        sessionExpired:   false,
 
         // ERP Operations
         currentProvider: "quickbooks",
@@ -90,9 +106,70 @@ Office.onReady(() => {
         BASE: "http://localhost:8000",
 
         /**
-         * Authenticated fetch helper.
-         * Automatically attaches the JWT Bearer token from AppState to every
-         * request so all callers never have to think about auth headers.
+         * Centralized error reaction — every call through apiFetch funnels
+         * here. Branches on the standardized backend `code` field (never on
+         * message text) and reacts globally:
+         *   - ERR_CONNECTION_REFUSED  -> red offline banner + Retry
+         *   - ERR_SESSION_EXPIRED     -> toast + clear tokens + redirect to
+         *                                 Login + block further requests
+         *   - ERR_ERP_SESSION_EXPIRED -> orange banner + Reconnect
+         * Any other code is left to the caller's own try/catch — this only
+         * reacts to the three centrally-handled scenarios.
+         * @param {ApiError} apiErr
+         * @param {{ retry?: () => void }} [opts]
+         */
+        handleGlobalApiError(apiErr, opts = {}) {
+            switch (apiErr.code) {
+                case ERROR_CODES.CONNECTION_REFUSED: {
+                    showBanner({
+                        type: "offline",
+                        message: apiErr.message,
+                        actionLabel: "Retry",
+                        onAction: () => {
+                            hideBanner();
+                            if (opts.retry) opts.retry();
+                        }
+                    });
+                    break;
+                }
+                case ERROR_CODES.SESSION_EXPIRED: {
+                    // Avoid re-triggering the redirect/toast for every
+                    // in-flight request that fails after the first 401.
+                    if (AppState.sessionExpired) break;
+                    AppState.sessionExpired = true;
+                    showToast(getFriendlyMessage(ERROR_CODES.SESSION_EXPIRED));
+                    AuthService.logout();
+                    break;
+                }
+                case ERROR_CODES.ERP_SESSION_EXPIRED: {
+                    const provider = AppState.currentProvider === "xero" ? "Xero" : "QuickBooks";
+                    showBanner({
+                        type: "erp",
+                        message: apiErr.message,
+                        actionLabel: "Reconnect",
+                        onAction: () => {
+                            hideBanner();
+                            DashboardService.launchERPOAuth(AppState.currentProvider === "xero" ? "xero" : "quickbooks");
+                        }
+                    });
+                    void provider; // reserved for future provider-specific copy
+                    break;
+                }
+                default:
+                    // Not one of the three centrally-handled scenarios —
+                    // caller's own catch block is responsible for the UI.
+                    break;
+            }
+        },
+
+        /**
+         * Authenticated fetch helper — the single choke point every API call
+         * in this app goes through. Automatically attaches the JWT Bearer
+         * token, and centrally reacts to the app's three standardized error
+         * scenarios (offline/unreachable backend, expired session, expired
+         * ERP connection) via handleGlobalApiError above, in addition to
+         * returning the raw Response so existing callers keep working
+         * unchanged (their own res.ok / res.json() handling still applies).
          *
          * Usage (same API as window.fetch):
          *   const res = await ApiService.apiFetch('/api/connections', { method: 'GET' });
@@ -101,13 +178,43 @@ Office.onReady(() => {
          * @param {object}  options  - Standard fetch options (method, body, headers, …)
          * @returns {Promise<Response>}
          */
-        apiFetch(path, options = {}) {
+        async apiFetch(path, options = {}) {
+            // Once a session-expired redirect has fired, refuse further
+            // requests until a fresh token is obtained via login — prevents
+            // a storm of repeated 401s while the user is on the Login view.
+            if (AppState.sessionExpired) {
+                throw new ApiError(ERROR_CODES.SESSION_EXPIRED, getFriendlyMessage(ERROR_CODES.SESSION_EXPIRED), "Blocked: session already marked expired.");
+            }
+
             const url = path.startsWith("http") ? path : `${this.BASE}${path}`;
             const headers = { ...(options.headers || {}) };
             if (AppState.jwtToken) {
                 headers["Authorization"] = `Bearer ${AppState.jwtToken}`;
             }
-            return fetch(url, { ...options, headers });
+
+            const retry = () => this.apiFetch(path, options);
+
+            let res;
+            try {
+                res = await fetch(url, { ...options, headers });
+            } catch (networkErr) {
+                const apiErr = networkError(networkErr);
+                this.handleGlobalApiError(apiErr, { retry });
+                throw apiErr;
+            }
+
+            if (!res.ok) {
+                const apiErr = await parseApiError(res.clone());
+                this.handleGlobalApiError(apiErr, { retry });
+                // Rethrow-free: callers keep doing their own `res.ok` /
+                // `res.json()` handling exactly as before. The global
+                // reaction above already fired as a side effect.
+                return res;
+            }
+
+            // A successful call clears any stale offline banner.
+            hideBanner();
+            return res;
         },
 
         /**
@@ -127,6 +234,7 @@ Office.onReady(() => {
                 // Persist the token if the backend returned one
                 if (result.token) {
                     AppState.jwtToken = result.token;
+                    AppState.sessionExpired = false; // fresh token — lift the request block
                     localStorage.setItem("fa_jwt_token", result.token);
                 }
                 return result;
@@ -162,14 +270,22 @@ Office.onReady(() => {
          * @returns {Promise<object>} Map of company, customers, vendors, accounts, classes, locations
          */
         async fetchMasterData(provider, companyId) {
-            const res = await this.apiFetch("/api/pull-master-data", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ companyId, platform: provider, tier: AppState.currentTier })
+            const params = new URLSearchParams({
+                companyId: companyId || "",
+                platform:  provider || "",
+                tier:      AppState.currentTier || ""
+            });
+            const res = await this.apiFetch(`/api/pull-master-data?${params.toString()}`, {
+                method: "GET"
             });
             if (!res.ok) {
-                const err = await res.json().catch(() => ({}));
-                throw new Error(err.error || `Failed to fetch master data for company ${companyId}`);
+                // apiFetch already triggered the global reaction (offline
+                // banner / ERP-expired banner) as a side effect above.
+                // Re-parse here too (parseApiError clones internally, so
+                // this doesn't double-consume the body) so this call's own
+                // catch block can branch on `.code` instead of guessing
+                // from message text.
+                throw await parseApiError(res);
             }
             const data = await res.json();
 
@@ -538,6 +654,7 @@ Office.onReady(() => {
             // Persist the JWT token so all subsequent API calls are authenticated
             if (token) {
                 AppState.jwtToken = token;
+                AppState.sessionExpired = false; // fresh token — lift the request block
                 localStorage.setItem("fa_jwt_token", token);
             }
 
@@ -568,6 +685,7 @@ Office.onReady(() => {
             // Persist token from popup if provided (avoids a round-trip)
             if (token) {
                 AppState.jwtToken = token;
+                AppState.sessionExpired = false; // fresh token — lift the request block
                 localStorage.setItem("fa_jwt_token", token);
             }
 
@@ -723,6 +841,13 @@ Office.onReady(() => {
             AppState.erpOrgName       = null;
             AppState.erpConnectedDate = null;
             AppState.jwtToken         = null;  // Clear the JWT token on logout
+            // Note: AppState.sessionExpired is deliberately NOT reset here —
+            // it's only cleared once a fresh token is obtained via a
+            // successful login (see checkSubscription / handleGoogleAuth /
+            // handleReturningUser), so a burst of already-in-flight requests
+            // failing right after logout can't re-trigger the redirect loop.
+
+            hideBanner();
 
             [
                 "fa_user_email", "fa_user_name", "fa_user_provider",
@@ -1609,13 +1734,14 @@ Office.onReady(() => {
             localStorage.setItem("fa_erp_type",      provider);
             localStorage.setItem("fa_erp_date",      now);
 
-            // Attempt to fetch org name from backend
-            const tokenUrl = isQB
-                ? `${ApiService.BASE}/api/quickbooks/tokens/`
-                : `${ApiService.BASE}/api/xero/tokens`;
+            // Attempt to fetch org name from backend. Uses apiFetch (not raw
+            // fetch) so the JWT is actually attached — this endpoint is
+            // authenticated, so without it every call here 401'd
+            // unconditionally and silently fell back to a random ID below.
+            const tokenPath = isQB ? "/api/quickbooks/tokens/" : "/api/xero/tokens";
 
-            fetch(tokenUrl)
-                .then(r => r.json())
+            ApiService.apiFetch(tokenPath)
+                .then(r => (r.ok ? r.json() : { tokens: [] }))
                 .then(data => {
                     const tokens = data.tokens || [];
                     const realmId = tokens[0]?.realm_id || tokens[0]?.tenant_name || null;
@@ -2224,7 +2350,11 @@ Office.onReady(() => {
                     DashboardService.renderERPSection();
                 } catch (error) {
                     console.error(error);
-                    const isExpired = error.message && error.message.toLowerCase().includes("session has expired");
+                    // ApiService already showed the orange "reconnect" banner
+                    // (or the offline banner) as a global side effect when
+                    // this came from apiFetch — branch on the standardized
+                    // `.code` here too, never on message text.
+                    const isExpired = error.code === ERROR_CODES.ERP_SESSION_EXPIRED;
                     const msg = isExpired
                         ? error.message
                         : "Error pulling data: " + error.message;
@@ -2290,7 +2420,11 @@ Office.onReady(() => {
                     DashboardService.renderERPSection();
                 } catch (error) {
                     console.error(error);
-                    const isExpired = error.message && error.message.toLowerCase().includes("session has expired");
+                    // ApiService already showed the orange "reconnect" banner
+                    // (or the offline banner) as a global side effect when
+                    // this came from apiFetch — branch on the standardized
+                    // `.code` here too, never on message text.
+                    const isExpired = error.code === ERROR_CODES.ERP_SESSION_EXPIRED;
                     const msg = isExpired
                         ? error.message
                         : "Error pulling data: " + error.message;

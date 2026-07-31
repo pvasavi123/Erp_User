@@ -3,6 +3,7 @@
 const AdminService = require('./service');
 const jwt = require('jsonwebtoken');
 const config = require('../../core/config');
+const { ValidationError, UnauthorizedError } = require('../../core/errors/AppError');
 
 /**
  * AdminController
@@ -19,15 +20,12 @@ class AdminController {
      * POST /api/admin/login
      * Authenticates an admin user.
      */
-    async login(req, res) {
+    async login(req, res, next) {
         try {
             const { email, password } = req.body;
 
             if (!email || !password) {
-                return res.status(400).json({
-                    success: false,
-                    message: 'Email and Password are required'
-                });
+                throw new ValidationError('Email and Password are required.');
             }
 
             const admin = await AdminService.login(email, password);
@@ -47,10 +45,7 @@ class AdminController {
                 token
             });
         } catch (error) {
-            return res.status(401).json({
-                success: false,
-                message: error.message
-            });
+            next(error instanceof Error && error.isOperational ? error : new UnauthorizedError(error.message));
         }
     }
 
@@ -58,15 +53,12 @@ class AdminController {
      * POST /api/admin/signup
      * Creates a new admin user.
      */
-    async signup(req, res) {
+    async signup(req, res, next) {
         try {
             const { name, email, password } = req.body;
 
             if (!name || !email || !password) {
-                return res.status(400).json({
-                    success: false,
-                    message: 'Name, Email and Password are required'
-                });
+                throw new ValidationError('Name, Email and Password are required.');
             }
 
             const admin = await AdminService.signup(name, email, password);
@@ -86,10 +78,7 @@ class AdminController {
                 token
             });
         } catch (error) {
-            return res.status(400).json({
-                success: false,
-                message: error.message
-            });
+            next(error instanceof Error && error.isOperational ? error : new ValidationError(error.message));
         }
     }
 }

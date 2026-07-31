@@ -1,6 +1,7 @@
 'use strict';
 
 const eventBus = require('../../core/events');
+const { ValidationError, NotFoundError } = require('../../core/errors/AppError');
 
 /**
  * BillingService
@@ -58,12 +59,12 @@ class BillingService {
      */
     async upgradePlanById(userId, newPlan) {
         if (!this.isValidPlan(newPlan)) {
-            throw Object.assign(new Error(`Invalid plan: ${newPlan}`), { statusCode: 400 });
+            throw new ValidationError(`Invalid plan: ${newPlan}.`);
         }
 
         const user = await this.userRepository.findById(userId);
         if (!user) {
-            throw Object.assign(new Error('User not found'), { statusCode: 404 });
+            throw new NotFoundError('User not found.');
         }
 
         // No prior plan means this is the user's first-ever plan
@@ -90,12 +91,12 @@ class BillingService {
      */
     async upgradePlanByEmail(email, newPlan) {
         if (!this.isValidPlan(newPlan)) {
-            throw Object.assign(new Error(`Invalid plan: ${newPlan}`), { statusCode: 400 });
+            throw new ValidationError(`Invalid plan: ${newPlan}.`);
         }
 
         const user = await this.userRepository.findByEmail(email);
         if (!user) {
-            throw Object.assign(new Error('User not found'), { statusCode: 404 });
+            throw new NotFoundError('User not found.');
         }
 
         // No prior plan means this is the user's first-ever plan

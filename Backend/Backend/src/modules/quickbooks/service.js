@@ -9,6 +9,7 @@ const QuickBooksTokenRepository = require('./repository');
 const QuickBooksMapper = require('./mapper');
 const logger       = require('../../core/logger');
 const QuickBooksTokenManager = require('./oauth/QuickBooksTokenManager');
+const { ErpSessionExpiredError } = require('../../core/errors/AppError');
 
 /**
  * QuickBooksService
@@ -107,7 +108,9 @@ class QuickBooksService {
         } else {
             const connections = await QuickBooksTokenRepository.getActiveTokens();
             const activeToken = connections[0];
-            if (!activeToken) throw new Error('QuickBooks is not connected.');
+            if (!activeToken) {
+                throw new ErpSessionExpiredError('QuickBooks', 'No active QuickBooks connection found.');
+            }
             realmId = activeToken.companyId || activeToken.realm_id;
             accessToken = await QuickBooksTokenManager.getValidToken(realmId);
         }
@@ -469,7 +472,10 @@ class QuickBooksService {
                         { status: 'Disconnected' },
                         { where: { realm_id: token.companyId } }
                     );
-                    throw new Error(`Your session has expired for company "${token.companyName}". Please reconnect to the company again and continue your process.`);
+                    throw new ErpSessionExpiredError(
+                        'QuickBooks',
+                        `QuickBooks refresh token expired/revoked for company "${token.companyName}" (${token.companyId}): ${err.message}`
+                    );
                 }
 
                 throw err;

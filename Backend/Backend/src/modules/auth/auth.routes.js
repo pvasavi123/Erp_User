@@ -17,9 +17,11 @@ const { authenticate } = require('./auth.middleware');
  *   GET  /api/auth/google/callback
  *   GET  /api/auth/microsoft/connect
  *   GET  /api/auth/microsoft/callback
+ *   POST /api/auth/logout
  *
  * Protected (JWT required):
  *   GET  /api/auth/me
+ *   POST /api/auth/update-plan
  * ----------------------------------------------------------------
  */
 
@@ -34,6 +36,12 @@ router.get('/google/callback', controller.googleCallback);
 // Microsoft Entra ID (Azure AD) OAuth
 router.get('/microsoft/connect',  controller.microsoftConnect);
 router.get('/microsoft/callback', controller.microsoftCallback);
+
+// Session teardown — intentionally NOT behind `authenticate`. The whole
+// point is to let a client with an already-expired/invalid token still
+// clear its server-side session; requiring a valid JWT here would 401
+// exactly when a client most needs to call it.
+router.post('/logout', controller.logout);
 
 // Protected endpoints
 router.get('/me', authenticate, controller.getMe);

@@ -5,6 +5,7 @@ const AuthValidation = require('./auth.validation');
 const UserRepository = require('./user.repository');
 const OAuthPopupView = require('./views/oauthPopup.view');
 const logger         = require('../../core/logger');
+const { ValidationError, UnauthorizedError, NotFoundError, InternalServerError } = require('../../core/errors/AppError');
 
 /**
  * AuthController
@@ -18,11 +19,11 @@ class AuthController {
     // ----------------------------------------------------------------
     // POST /api/auth/signup
     // ----------------------------------------------------------------
-    async signup(req, res) {
+    async signup(req, res, next) {
         try {
             const { valid, errors } = AuthValidation.validateSignup(req.body);
             if (!valid) {
-                return res.status(400).json({ success: false, message: errors.join(', ') });
+                throw new ValidationError(errors.join(', '));
             }
 
             const { name, email, password } = req.body;
@@ -34,19 +35,18 @@ class AuthController {
                 user:    result.user
             });
         } catch (error) {
-            logger.error('Signup error', error.message);
-            return res.status(400).json({ success: false, message: error.message });
+            next(error instanceof Error && error.isOperational ? error : new ValidationError(error.message));
         }
     }
 
     // ----------------------------------------------------------------
     // POST /api/auth/login
     // ----------------------------------------------------------------
-    async login(req, res) {
+    async login(req, res, next) {
         try {
             const { valid, errors } = AuthValidation.validateLogin(req.body);
             if (!valid) {
-                return res.status(400).json({ success: false, message: errors.join(', ') });
+                throw new ValidationError(errors.join(', '));
             }
 
             const { email, password } = req.body;
@@ -58,8 +58,7 @@ class AuthController {
                 user:    result.user
             });
         } catch (error) {
-            logger.error('Login error', error.message);
-            return res.status(401).json({ success: false, message: error.message });
+            next(error instanceof Error && error.isOperational ? error : new UnauthorizedError(error.message));
         }
     }
 
@@ -794,11 +793,11 @@ class AuthController {
     // ----------------------------------------------------------------
     // GET /api/auth/me   (protected)
     // ----------------------------------------------------------------
-    async getMe(req, res) {
+    async getMe(req, res, next) {
         try {
             const user = await UserRepository.findById(req.user.userId);
             if (!user) {
-                return res.status(404).json({ success: false, message: 'User not found' });
+                throw new NotFoundError('User not found.');
             }
             return res.json({
                 success: true,
@@ -812,19 +811,37 @@ class AuthController {
                 }
             });
         } catch (error) {
-            logger.error('getMe error', error.message);
-            return res.status(500).json({ success: false, message: 'Internal server error' });
+            next(error instanceof Error && error.isOperational ? error : new InternalServerError(error.message));
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // POST /api/auth/logout
+    // ----------------------------------------------------------------
+    // JWT auth is stateless — the frontend already discards its token and
+    // redirects to the Login view on its own. This endpoint just clears
+    // any server-side OAuth session leftovers (req.session.user_mail,
+    // xero_pending_*, etc.) so a stale session cookie can't leak into the
+    // next sign-in attempt on the same browser.
+    async logout(req, res, next) {
+        try {
+            if (req.session) {
+                req.session.destroy(() => {});
+            }
+            return res.json({ success: true, message: 'Logged out.' });
+        } catch (error) {
+            next(error instanceof Error && error.isOperational ? error : new InternalServerError(error.message));
         }
     }
 
     // ----------------------------------------------------------------
     // POST /api/auth/update-plan
     // ----------------------------------------------------------------
-    async updatePlan(req, res) {
+    async updatePlan(req, res, next) {
         try {
             const { plan } = req.body;
             if (!plan) {
-                return res.status(400).json({ success: false, message: 'Plan is required' });
+                throw new ValidationError('Plan is required.');
             }
 
             const user = await UserRepository.findById(req.user.userId);
@@ -855,8 +872,7 @@ class AuthController {
 
             return res.json({ success: true, message: 'Plan updated successfully' });
         } catch (error) {
-            logger.error('updatePlan error', error.message);
-            return res.status(500).json({ success: false, message: 'Internal server error' });
+            next(error instanceof Error && error.isOperational ? error : new InternalServerError(error.message));
         }
     }
 }

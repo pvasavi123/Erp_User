@@ -4,10 +4,10 @@ const querystring  = require('querystring');
 const exceljs      = require('exceljs');
 const config       = require('../../core/config');
 const CONSTANTS    = require('../../core/constants');
-const logger       = require('../../core/logger');
 const { generateOAuthState } = require('../../core/helpers');
 const QuickBooksService    = require('./service');
 const QuickBooksTokenRepository = require('./repository');
+const { ValidationError } = require('../../core/errors/AppError');
 
 /**
  * QuickbooksController
@@ -24,7 +24,7 @@ class QuickbooksController {
      * GET /api/quickbooks/connect
      * Generates the QuickBooks OAuth authorization URL and redirects.
      */
-    connectQuickbooks = async (req, res) => {
+    connectQuickbooks = async (req, res, next) => {
         try {
             const { QuickBooksToken } = require('../../core/database');
             const mail = req.query.mail || req.session?.user_mail || req.session?.admin?.email || req.session?.googleUser?.email || null;
@@ -67,8 +67,7 @@ class QuickbooksController {
             const authUrl = `${CONSTANTS.QUICKBOOKS.AUTH_URL}?${querystring.stringify(params)}`;
             res.redirect(authUrl);
         } catch (error) {
-            logger.error('Error generating QB OAuth URL', error);
-            res.status(500).json({ error: 'Failed to generate authorization url' });
+            next(error);
         }
     };
 
@@ -76,7 +75,7 @@ class QuickbooksController {
      * GET /api/quickbooks/callback
      * Handles the OAuth callback, exchanges code for tokens.
      */
-    quickbooksCallback = async (req, res) => {
+    quickbooksCallback = async (req, res, next) => {
         try {
             const { code, realmId } = req.query;
             const mail = req.session?.user_mail || req.session?.admin?.email || req.session?.googleUser?.email || null;
@@ -84,11 +83,8 @@ class QuickbooksController {
             await QuickBooksService.exchangeAndSaveToken(code, realmId, sessionInfo, mail);
             return res.send(CONSTANTS.QUICKBOOKS.SUCCESS_HTML);
         } catch (error) {
-            logger.error('QB OAuth callback failed', error.response?.data || error.message);
-            return res.status(400).json({
-                error:   'Failed to connect',
-                details: error.response?.data || error.message
-            });
+            const details = JSON.stringify(error.response?.data || error.message);
+            next(new ValidationError('Failed to connect QuickBooks. Please try again.', details));
         }
     };
 
@@ -96,12 +92,12 @@ class QuickbooksController {
      * GET /api/quickbooks/tokens
      * Returns all stored QuickBooks OAuth tokens (for debugging).
      */
-    listQuickbooksTokens = async (req, res) => {
+    listQuickbooksTokens = async (req, res, next) => {
         try {
             const tokens = await QuickBooksTokenRepository.getAllTokens();
             res.json({ tokens });
         } catch (error) {
-            res.status(500).json({ error: error.message });
+            next(error);
         }
     };
 
@@ -109,12 +105,12 @@ class QuickbooksController {
      * GET /api/quickbooks/customers
      * Returns a list of mapped CustomerDTOs.
      */
-    getCustomers = async (req, res) => {
+    getCustomers = async (req, res, next) => {
         try {
             const customers = await QuickBooksService.getCustomers();
             res.json({ customers });
         } catch (err) {
-            res.status(500).json({ error: err.message });
+            next(err);
         }
     };
 
@@ -122,12 +118,12 @@ class QuickbooksController {
      * GET /api/quickbooks/vendors
      * Returns a list of mapped VendorDTOs.
      */
-    getVendors = async (req, res) => {
+    getVendors = async (req, res, next) => {
         try {
             const vendors = await QuickBooksService.getVendors();
             res.json({ vendors });
         } catch (err) {
-            res.status(500).json({ error: err.message });
+            next(err);
         }
     };
 
@@ -135,12 +131,12 @@ class QuickbooksController {
      * GET /api/quickbooks/accounts
      * Returns a list of mapped AccountDTOs.
      */
-    getAccounts = async (req, res) => {
+    getAccounts = async (req, res, next) => {
         try {
             const accounts = await QuickBooksService.getAccounts();
             res.json({ accounts });
         } catch (err) {
-            res.status(500).json({ error: err.message });
+            next(err);
         }
     };
 
@@ -148,12 +144,12 @@ class QuickbooksController {
      * GET /api/quickbooks/classes
      * Returns a list of mapped ClassDTOs.
      */
-    getClasses = async (req, res) => {
+    getClasses = async (req, res, next) => {
         try {
             const classes = await QuickBooksService.getClasses();
             res.json({ classes });
         } catch (err) {
-            res.status(500).json({ error: err.message });
+            next(err);
         }
     };
 
@@ -161,12 +157,12 @@ class QuickbooksController {
      * GET /api/quickbooks/locations
      * Returns a list of mapped LocationDTOs.
      */
-    getLocations = async (req, res) => {
+    getLocations = async (req, res, next) => {
         try {
             const locations = await QuickBooksService.getLocations();
             res.json({ locations });
         } catch (err) {
-            res.status(500).json({ error: err.message });
+            next(err);
         }
     };
 
@@ -174,12 +170,12 @@ class QuickbooksController {
      * GET /api/quickbooks/company
      * Returns company information DTO.
      */
-    getCompanyInfo = async (req, res) => {
+    getCompanyInfo = async (req, res, next) => {
         try {
             const company = await QuickBooksService.getCompanyInfo();
             res.json({ company });
         } catch (err) {
-            res.status(500).json({ error: err.message });
+            next(err);
         }
     };
 
@@ -187,7 +183,7 @@ class QuickbooksController {
      * GET /api/quickbooks/export
      * Exports company, customers, vendors, accounts, classes, and locations as an Excel file.
      */
-    exportMasterData = async (req, res) => {
+    exportMasterData = async (req, res, next) => {
         try {
             const [company, customers, vendors, accounts, classes, locations] = await Promise.all([
                 QuickBooksService.getCompanyInfo().catch(() => null),
@@ -242,7 +238,7 @@ class QuickbooksController {
             await wb.xlsx.write(res);
             res.end();
         } catch (error) {
-            res.status(500).json({ error: error.message });
+            next(error);
         }
     };
 
@@ -250,12 +246,12 @@ class QuickbooksController {
      * POST /api/quickbooks/disconnect
      * Clears all stored QuickBooks tokens.
      */
-    disconnectQuickbooks = async (req, res) => {
+    disconnectQuickbooks = async (req, res, next) => {
         try {
             await QuickBooksTokenRepository.clearTokens();
             res.json({ success: true, message: 'QuickBooks tokens cleared successfully.' });
         } catch (error) {
-            res.status(500).json({ success: false, error: error.message });
+            next(error);
         }
     };
 }
