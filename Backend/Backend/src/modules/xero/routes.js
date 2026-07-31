@@ -9,7 +9,7 @@ const { authenticate } = require('../auth/auth.middleware');
 // OAuth
 router.get('/connect',             controller.connectXero);
 router.get('/callback',            validateXeroState, controller.xeroCallback);
-router.post('/select-companies',   authenticate, controller.selectCompanies);
+router.post('/select-companies',   controller.selectCompanies);
 router.post('/disconnect',         authenticate, controller.disconnectXero);
 router.get(['/tokens', '/tokens/'], authenticate, controller.listXeroTokens);
 

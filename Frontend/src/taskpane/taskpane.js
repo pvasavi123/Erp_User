@@ -1076,7 +1076,7 @@ Office.onReady(() => {
                                     <div class="xero-company-icon">xero</div>
                                     <div class="xero-company-info">
                                         <div class="xero-company-name">${c.companyName || "Xero Organisation"}</div>
-                                        <div class="xero-company-id">Realm: ${c.companyId || "—"}</div>
+                                        <div class="xero-company-id">Tenant: ${c.companyId || "—"}</div>
                                     </div>
                                 `;
 
@@ -1280,7 +1280,8 @@ Office.onReady(() => {
                     // itself, not as a separate label elsewhere in the row)
                     const connStatus = document.querySelector(".fa-conn-status");
                     if (connStatus && activeConn) {
-                        connStatus.innerHTML = `<span class="fa-realm-label">Realm ID:</span> <span id="connRealmId">${activeConn.companyId || "—"}</span>`;
+                        const idLabel = isQB ? "Realm ID" : "Tenant ID";
+                        connStatus.innerHTML = `<span class="fa-realm-label">${idLabel}:</span> <span id="connRealmId">${activeConn.companyId || "—"}</span>`;
                     }
 
                     // Update Disconnect button label
@@ -2091,7 +2092,7 @@ Office.onReady(() => {
                                 <div class="fa-company-icon ${isXero ? 'xero-company-icon' : ''}">${isXero ? 'xero' : 'qb'}</div>
                                 <div class="fa-company-info">
                                     <div class="fa-company-name">${displayName}${isDisconnected ? ' <span style="color:#ef4444;font-size:10px">(Disconnected)</span>' : ''}</div>
-                                    <div class="fa-company-tag">Realm ID: ${c.companyId || "—"}</div>
+                                    <div class="fa-company-tag">${isXero ? "Tenant ID" : "Realm ID"}: ${c.companyId || "—"}</div>
                                 </div>
                             `;
                             row.addEventListener("click", () => {
