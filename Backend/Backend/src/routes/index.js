@@ -15,7 +15,7 @@
 
 const express = require('express');
 const router  = express.Router();
-const { ValidationError, NotFoundError } = require('../core/errors/AppError');
+const { AppError, ValidationError } = require('../core/errors/AppError');
 
 // ── Core domain modules ───────────────────────────────────────────
 const authRoutes        = require('../modules/auth/auth.routes');
@@ -234,7 +234,7 @@ router.get('/pull-master-data', authenticate, async (req, res, next) => {
         }
 
         if (!aggregated) {
-            throw new NotFoundError(`No active connections found for ${platform}.`);
+            throw new AppError('The requested resource was not found.', 404, 'ERR_NOT_FOUND', `No active connections found for ${platform}.`);
         }
 
         // This runs on the backend Node process, so this log shows up in

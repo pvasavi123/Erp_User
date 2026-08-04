@@ -80,55 +80,10 @@ class ErpSessionExpiredError extends AppError {
     }
 }
 
-/**
- * 502 — Transient failure talking to the ERP provider (network blip,
- * provider outage) — NOT a revoked/expired connection, so we don't force
- * the user to reconnect; a retry is reasonable.
- */
-class ErpRefreshFailedError extends AppError {
-    constructor(provider = 'ERP', details = 'Failed to refresh OAuth token.') {
-        super(
-            `Could not reach ${provider}. Please try again shortly.`,
-            502,
-            'ERR_ERP_REFRESH_FAILED',
-            details
-        );
-        this.provider = provider;
-    }
-}
-
 /** 400 — Malformed / missing request input. */
 class ValidationError extends AppError {
     constructor(message = 'Invalid request.', details = null) {
         super(message, 400, 'ERR_VALIDATION', details || message);
-    }
-}
-
-/** 401 — Bad credentials, not-yet-authenticated. */
-class UnauthorizedError extends AppError {
-    constructor(message = 'Invalid credentials.', details = null) {
-        super(message, 401, 'ERR_UNAUTHORIZED', details || message);
-    }
-}
-
-/** 403 — Authenticated, but not allowed to do this. */
-class ForbiddenError extends AppError {
-    constructor(message = 'You do not have permission to perform this action.', details = null) {
-        super(message, 403, 'ERR_FORBIDDEN', details || message);
-    }
-}
-
-/** 404 — Resource doesn't exist. */
-class NotFoundError extends AppError {
-    constructor(message = 'The requested resource was not found.', details = null) {
-        super(message, 404, 'ERR_NOT_FOUND', details || message);
-    }
-}
-
-/** 409 — Request conflicts with current state (duplicate email, etc.). */
-class ConflictError extends AppError {
-    constructor(message = 'This action conflicts with existing data.', details = null) {
-        super(message, 409, 'ERR_CONFLICT', details || message);
     }
 }
 
@@ -139,29 +94,11 @@ class LimitReachedError extends AppError {
     }
 }
 
-/** 500 — Fallback for anything unexpected. Never leaks the real message to the user. */
-class InternalServerError extends AppError {
-    constructor(details = 'Unexpected server error.') {
-        super(
-            'Something went wrong on our end. Please try again later.',
-            500,
-            'ERR_INTERNAL',
-            details
-        );
-    }
-}
-
 module.exports = {
     AppError,
     ConnectionRefusedError,
     SessionExpiredError,
     ErpSessionExpiredError,
-    ErpRefreshFailedError,
     ValidationError,
-    UnauthorizedError,
-    ForbiddenError,
-    NotFoundError,
-    ConflictError,
-    LimitReachedError,
-    InternalServerError
+    LimitReachedError
 };

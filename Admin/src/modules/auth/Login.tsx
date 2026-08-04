@@ -120,6 +120,10 @@ export default function Login() {
     if (!popup || popup.closed) {
       window.removeEventListener("message", msgHandler);
       toast.error("Popup was blocked. Please allow popups and try again.");
+    } else {
+      // Bring the popup to the front — without this it can open behind
+      // the main window in some browsers/OS window managers.
+      popup.focus();
     }
   };
 

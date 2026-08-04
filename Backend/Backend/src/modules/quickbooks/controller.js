@@ -204,33 +204,23 @@ class QuickbooksController {
 
             const wsCustomers = wb.addWorksheet('Customers');
             wsCustomers.addRow(['ID', 'Name', 'Company Name', 'Email', 'Balance']);
-            for (const c of customers) {
-                wsCustomers.addRow([c.id, c.name, c.companyName, c.email, c.balance]);
-            }
+            wsCustomers.addRows(customers.map(c => [c.id, c.name, c.companyName, c.email, c.balance]));
 
             const wsVendors = wb.addWorksheet('Vendors');
             wsVendors.addRow(['ID', 'Name', 'Company Name', 'Email', 'Balance']);
-            for (const v of vendors) {
-                wsVendors.addRow([v.id, v.name, v.companyName, v.email, v.balance]);
-            }
+            wsVendors.addRows(vendors.map(v => [v.id, v.name, v.companyName, v.email, v.balance]));
 
             const wsAccounts = wb.addWorksheet('Accounts');
             wsAccounts.addRow(['ID', 'Acct #', 'Name', 'Account Type', 'Sub Type', 'Balance']);
-            for (const a of accounts) {
-                wsAccounts.addRow([a.id, a.acctNum, a.name, a.accountType, a.accountSubType, a.currentBalance]);
-            }
+            wsAccounts.addRows(accounts.map(a => [a.id, a.acctNum, a.name, a.accountType, a.accountSubType, a.currentBalance]));
 
             const wsClasses = wb.addWorksheet('Classes');
             wsClasses.addRow(['ID', 'Name', 'Status']);
-            for (const c of classes) {
-                wsClasses.addRow([c.id, c.name, c.active]);
-            }
+            wsClasses.addRows(classes.map(c => [c.id, c.name, c.active]));
 
             const wsLocations = wb.addWorksheet('Locations');
             wsLocations.addRow(['ID', 'Name', 'Status']);
-            for (const l of locations) {
-                wsLocations.addRow([l.id, l.name, l.active]);
-            }
+            wsLocations.addRows(locations.map(l => [l.id, l.name, l.active]));
 
             res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
             res.setHeader('Content-Disposition', 'attachment; filename="quickbooks_master_data.xlsx"');

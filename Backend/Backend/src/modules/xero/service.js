@@ -63,8 +63,8 @@ class XeroService {
         if (tenants.length === 0) throw new Error('No Xero organisation connected.');
 
         // Persist token records for ALL connected organisations/tenants
-        for (const tenant of tenants) {
-            await XeroTokenRepository.upsertToken({
+        await Promise.all(tenants.map(tenant => 
+            XeroTokenRepository.upsertToken({
                 tenant_id:    tenant.tenantId,
                 access_token: tokens.access_token || '',
                 refresh_token: tokens.refresh_token || '',
@@ -75,9 +75,8 @@ class XeroService {
                 mail:         mail,
                 company_name: tenant.tenantName || 'Xero Organisation',
                 status:       'Active'
-            });
-
-        }
+            })
+        ));
 
         return tenants[0];
     }
@@ -133,8 +132,8 @@ class XeroService {
 
         if (toSave.length === 0) throw new Error('No valid tenants selected.');
 
-        for (const tenant of toSave) {
-            await XeroTokenRepository.upsertToken({
+        await Promise.all(toSave.map(tenant =>
+            XeroTokenRepository.upsertToken({
                 tenant_id:     tenant.tenantId,
                 access_token:  tokens.access_token  || '',
                 refresh_token: tokens.refresh_token || '',
@@ -145,8 +144,8 @@ class XeroService {
                 mail,
                 company_name:  tenant.tenantName || 'Xero Organisation',
                 status:        'Active'
-            });
-        }
+            })
+        ));
 
         return toSave;
     }
@@ -181,9 +180,7 @@ class XeroService {
      */
     static async getOrganisation() {
         const tokens = await XeroService.getAllTokens();
-        const orgs = [];
-
-        for (const token of tokens) {
+        const results = await Promise.all(tokens.map(async (token) => {
             try {
                 const tenantId = token.companyId || token.tenant_id;
                 const accessToken = await XeroTokenManager.getValidToken(tenantId);
@@ -196,13 +193,15 @@ class XeroService {
                 const org = XeroMapper.toOrganisation(res.data);
                 if (org) {
                     org.id = tenantId;
-                    orgs.push(org);
+                    return org;
                 }
             } catch (err) {
                 const tenantId = token.companyId || token.tenant_id;
                 logger.error(`Error fetching Xero organisation for tenant ${tenantId}:`, err.message);
             }
-        }
+            return null;
+        }));
+        const orgs = results.filter(Boolean);
         return orgs.length === 1 ? orgs[0] : orgs;
     }
 
@@ -212,9 +211,7 @@ class XeroService {
      */
     static async getContacts() {
         const tokens = await XeroService.getAllTokens();
-        let allContacts = [];
-
-        for (const token of tokens) {
+        const results = await Promise.all(tokens.map(async (token) => {
             try {
                 const tenantId = token.companyId || token.tenant_id;
                 const accessToken = await XeroTokenManager.getValidToken(tenantId);
@@ -233,17 +230,18 @@ class XeroService {
 
                 const response = await axios.get(CONSTANTS.XERO.CONTACTS_URL, { headers });
                 const contacts = XeroMapper.toContactList(response.data);
-                for (const c of contacts) {
-                    c.clientId   = tenantId;
-                    c.clientName = orgName;
-                    allContacts.push(c);
-                }
+                return contacts.map(c => ({
+                    ...c,
+                    clientId: tenantId,
+                    clientName: orgName
+                }));
             } catch (err) {
                 const tenantId = token.companyId || token.tenant_id;
                 logger.error(`Error fetching Xero contacts for tenant ${tenantId}:`, err.message);
+                return [];
             }
-        }
-        return allContacts;
+        }));
+        return results.flat();
     }
 
     /**
@@ -252,9 +250,7 @@ class XeroService {
      */
     static async getAccounts() {
         const tokens = await XeroService.getAllTokens();
-        let allAccounts = [];
-
-        for (const token of tokens) {
+        const results = await Promise.all(tokens.map(async (token) => {
             try {
                 const tenantId = token.companyId || token.tenant_id;
                 const accessToken = await XeroTokenManager.getValidToken(tenantId);
@@ -273,17 +269,18 @@ class XeroService {
 
                 const response = await axios.get(CONSTANTS.XERO.ACCOUNTS_URL, { headers });
                 const accounts = XeroMapper.toAccountList(response.data);
-                for (const a of accounts) {
-                    a.clientId   = tenantId;
-                    a.clientName = orgName;
-                    allAccounts.push(a);
-                }
+                return accounts.map(a => ({
+                    ...a,
+                    clientId: tenantId,
+                    clientName: orgName
+                }));
             } catch (err) {
                 const tenantId = token.companyId || token.tenant_id;
                 logger.error(`Error fetching Xero accounts for tenant ${tenantId}:`, err.message);
+                return [];
             }
-        }
-        return allAccounts;
+        }));
+        return results.flat();
     }
 
     /**
@@ -292,9 +289,7 @@ class XeroService {
      */
     static async getClasses() {
         const tokens = await XeroService.getAllTokens();
-        let allClasses = [];
-
-        for (const token of tokens) {
+        const results = await Promise.all(tokens.map(async (token) => {
             try {
                 const tenantId = token.companyId || token.tenant_id;
                 const accessToken = await XeroTokenManager.getValidToken(tenantId);
@@ -313,17 +308,18 @@ class XeroService {
 
                 const response = await axios.get(CONSTANTS.XERO.TRACKING_CATEGORIES_URL, { headers });
                 const classes = XeroMapper.toTrackingList(response.data, "class");
-                for (const c of classes) {
-                    c.clientId   = tenantId;
-                    c.clientName = orgName;
-                    allClasses.push(c);
-                }
+                return classes.map(c => ({
+                    ...c,
+                    clientId: tenantId,
+                    clientName: orgName
+                }));
             } catch (err) {
                 const tenantId = token.companyId || token.tenant_id;
                 logger.error(`Error fetching Xero classes for tenant ${tenantId}:`, err.message);
+                return [];
             }
-        }
-        return allClasses;
+        }));
+        return results.flat();
     }
 
     /**
@@ -332,9 +328,7 @@ class XeroService {
      */
     static async getLocations() {
         const tokens = await XeroService.getAllTokens();
-        let allLocations = [];
-
-        for (const token of tokens) {
+        const results = await Promise.all(tokens.map(async (token) => {
             try {
                 const tenantId = token.companyId || token.tenant_id;
                 const accessToken = await XeroTokenManager.getValidToken(tenantId);
@@ -353,17 +347,18 @@ class XeroService {
 
                 const response = await axios.get(CONSTANTS.XERO.TRACKING_CATEGORIES_URL, { headers });
                 const locations = XeroMapper.toTrackingList(response.data, "location");
-                for (const l of locations) {
-                    l.clientId   = tenantId;
-                    l.clientName = orgName;
-                    allLocations.push(l);
-                }
+                return locations.map(l => ({
+                    ...l,
+                    clientId: tenantId,
+                    clientName: orgName
+                }));
             } catch (err) {
                 const tenantId = token.companyId || token.tenant_id;
                 logger.error(`Error fetching Xero locations for tenant ${tenantId}:`, err.message);
+                return [];
             }
-        }
-        return allLocations;
+        }));
+        return results.flat();
     }
 
     // ── Self-contained Connections Management & Pulling ────────────────
@@ -384,8 +379,11 @@ class XeroService {
             companyName:  t.company_name || 'Xero Organisation',
             companyId:    t.tenant_id,
             status:       t.status || 'Active',
-            lastSyncedAt: t.last_synced_at || t.updated_at || null,
-            createdAt:    t.created_at || null
+            // XeroToken doesn't rename its timestamp attributes like
+            // QuickBooksToken does — the JS-side properties are the default
+            // updatedAt/createdAt, not updated_at/created_at.
+            lastSyncedAt: t.last_synced_at || t.updatedAt || null,
+            createdAt:    t.createdAt || null
         }));
     }
 
@@ -443,76 +441,55 @@ class XeroService {
             : await XeroToken.findAll({ where: { status: 'Active' }, order: [['updated_at', 'DESC']] });
 
         const tokens = rawTokens.slice(0, maxAllowed).map(t => ({
-            platform:     'xero',
-            companyId:    t.tenant_id,
-            companyName:  t.company_name || 'Xero Organisation',
-            accessToken:  t.access_token,
-            refreshToken: t.refresh_token,
-            tenant_id:    t.tenant_id,
-            access_token: t.access_token
+            platform:    'xero',
+            companyId:   t.tenant_id,
+            companyName: t.company_name || 'Xero Organisation',
+            tenant_id:   t.tenant_id
         }));
 
-        const aggregated = { company: [], customers: [], vendors: [], accounts: [], classes: [], locations: [] };
-
-        for (const token of tokens) {
+        const results = await Promise.all(tokens.map(async (token) => {
             try {
-                const headers = {
-                    Authorization:    `Bearer ${token.accessToken}`,
-                    'Xero-Tenant-Id': token.companyId,
-                    Accept:           'application/json'
-                };
-
+                // Route through XeroTokenManager for every call, same as
+                // XeroService.getContacts()/getAccounts()/etc. This gives us:
+                //  - proactive refresh (5 min before expiry) instead of only
+                //    reacting to a 401 after the token has already died
+                //  - the per-tenant lock, so two concurrent pulls can't both
+                //    try to redeem the same (single-use, rotating) refresh
+                //    token at once
+                //  - XeroTokenRepository's multi-tenant handling, which
+                //    updates every tenant row sharing the same refresh token
+                //    set — a bespoke single-row update here would silently
+                //    orphan a sibling company's refresh token on rotation
+                //    and cause a spurious "Reconnect" for it later
+                //  - the refresh-token-expired pre-flight check, so a dead
+                //    connection fails fast as ErpSessionExpiredError instead
+                //    of bouncing off a live 401 first
                 const xeroGet = async (url) => {
-                    try {
-                        return await axios.get(url, { headers });
-                    } catch (err) {
-                        if (err.response?.status === 401) {
-                            const { encodeBasicAuth } = require('../../core/helpers');
-                            const config = require('../../core/config');
-                            const credentials = encodeBasicAuth(config.XERO.CLIENT_ID, config.XERO.CLIENT_SECRET);
-
-                            let refreshRes;
-                            try {
-                                refreshRes = await axios.post(
-                                    CONSTANTS.XERO.TOKEN_URL,
-                                    new URLSearchParams({ grant_type: 'refresh_token', refresh_token: token.refreshToken }),
-                                    { headers: { Authorization: `Basic ${credentials}`, 'Content-Type': 'application/x-www-form-urlencoded' } }
-                                );
-                            } catch (refreshErr) {
-                                // The refresh call itself failing (invalid_grant, etc.)
-                                // means the connection is truly dead — tag it so the
-                                // outer catch can distinguish this from an unrelated
-                                // per-endpoint hiccup and surface ERR_ERP_SESSION_EXPIRED.
-                                refreshErr.isXeroAuthFailure = true;
-                                throw refreshErr;
-                            }
-
-                            token.accessToken  = refreshRes.data.access_token;
-                            token.refreshToken = refreshRes.data.refresh_token;
-                            headers.Authorization = `Bearer ${token.accessToken}`;
-
-                            await XeroToken.update(
-                                { access_token: token.accessToken, refresh_token: token.refreshToken },
-                                { where: { tenant_id: token.companyId } }
-                            );
-
-                            return axios.get(url, { headers });
-                        }
-                        throw err;
-                    }
+                    const accessToken = await XeroTokenManager.getValidToken(token.companyId);
+                    const headers = {
+                        Authorization:    `Bearer ${accessToken}`,
+                        'Xero-Tenant-Id': token.companyId,
+                        Accept:           'application/json'
+                    };
+                    return axios.get(url, { headers });
                 };
 
-                // Fetch organisation first, un-swallowed, so a dead connection
-                // (refresh token expired/revoked, OR the backend simply can't
-                // reach Xero at all — no internet, DNS failure, Xero outage)
-                // surfaces as a real failure instead of silently producing an
-                // all-empty "success". The other three calls stay best-effort
-                // so one bad endpoint doesn't sink an otherwise-successful pull.
                 const orgSettled = await Promise.allSettled([xeroGet(CONSTANTS.XERO.ORGANISATION_URL)]);
                 if (orgSettled[0].status === 'rejected') {
                     const reason = orgSettled[0].reason;
 
-                    if (reason?.isXeroAuthFailure || isAuthError(reason)) {
+                    // XeroTokenManager already throws ErpSessionExpiredError
+                    // (via OAuthTokenRevokedError) once refresh fails or the
+                    // refresh token is expired — pass it straight through.
+                    if (reason instanceof ErpSessionExpiredError) {
+                        throw reason;
+                    }
+
+                    // Otherwise this is a raw axios failure from the actual
+                    // Xero API call (e.g. the "valid" token was rejected
+                    // anyway) — treat auth-shaped errors as a revoked
+                    // connection too.
+                    if (isAuthError(reason)) {
                         await XeroToken.update(
                             { status: 'Disconnected' },
                             { where: { tenant_id: token.companyId } }
@@ -522,15 +499,6 @@ class XeroService {
                             `Xero refresh token expired/revoked for company "${token.companyName}" (${token.companyId}): ${reason?.message}`
                         );
                     }
-
-                    // Not an auth problem (e.g. ENOTFOUND/ECONNREFUSED/ETIMEDOUT
-                    // reaching Xero, or a Xero-side outage) — rethrow so it
-                    // reaches the centralized error middleware, which
-                    // recognizes raw network error codes and reports
-                    // ERR_CONNECTION_REFUSED (503) instead of silently
-                    // pretending the pull succeeded with no data. This
-                    // mirrors QuickBooksService.pullMasterData's `throw err;`
-                    // fallback for the same class of failure.
                     throw reason;
                 }
                 const orgRes = orgSettled[0].value;
@@ -544,7 +512,7 @@ class XeroService {
                 const company  = orgRes ? XeroMapper.toOrganisation(orgRes.data) : null;
                 const orgName  = company?.name || token.companyName;
 
-                if (company) { company.id = token.companyId; aggregated.company.push(company); }
+                const companyList = company ? [{ ...company, id: token.companyId }] : [];
 
                 const contacts  = contactRes ? XeroMapper.toContactList(contactRes.data) : [];
                 const accounts  = accRes     ? XeroMapper.toAccountList(accRes.data)     : [];
@@ -553,27 +521,33 @@ class XeroService {
 
                 const tag = items => items.map(i => ({ ...i, clientId: orgName, clientName: orgName }));
 
-                aggregated.customers.push(...tag(contacts.filter(c =>  c.isCustomer || !c.isSupplier)));
-                aggregated.vendors.push(  ...tag(contacts.filter(c =>  c.isSupplier)));
-                aggregated.accounts.push( ...tag(accounts));
-                aggregated.classes.push(  ...tag(classes));
-                aggregated.locations.push(...tag(locations));
-
                 await XeroToken.update(
                     { last_synced_at: new Date() },
                     { where: { tenant_id: token.companyId } }
                 );
+
+                return {
+                    company: companyList,
+                    customers: tag(contacts.filter(c => c.isCustomer || !c.isSupplier)),
+                    vendors: tag(contacts.filter(c => c.isSupplier)),
+                    accounts: tag(accounts),
+                    classes: tag(classes),
+                    locations: tag(locations)
+                };
             } catch (err) {
                 logger.error(`Error pulling Xero data for connection ${token.companyId}:`, err.message);
-                // Propagate (matches QuickBooksService.pullMasterData) so the
-                // controller/error middleware sees the real failure — including
-                // ErpSessionExpiredError thrown above — instead of silently
-                // returning an empty result set.
                 throw err;
             }
-        }
+        }));
 
-        return aggregated;
+        return results.reduce((acc, curr) => ({
+            company: [...acc.company, ...curr.company],
+            customers: [...acc.customers, ...curr.customers],
+            vendors: [...acc.vendors, ...curr.vendors],
+            accounts: [...acc.accounts, ...curr.accounts],
+            classes: [...acc.classes, ...curr.classes],
+            locations: [...acc.locations, ...curr.locations]
+        }), { company: [], customers: [], vendors: [], accounts: [], classes: [], locations: [] });
     }
 }
 

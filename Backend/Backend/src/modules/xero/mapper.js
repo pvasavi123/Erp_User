@@ -115,20 +115,14 @@ class XeroMapper {
      */
     static toTrackingList(apiResponse, type = "class") {
         const categories = apiResponse?.TrackingCategories || [];
-        const items = [];
-        for (const cat of categories) {
-            const catName = (cat.Name || '').toLowerCase();
-            const isTarget = type === 'location' 
-                ? (catName.includes('location') || catName.includes('region') || catName.includes('department'))
-                : (!catName.includes('location') && !catName.includes('region'));
-
-            if (isTarget && cat.Options) {
-                for (const opt of cat.Options) {
-                    items.push(XeroMapper.toTrackingOptionDTO(opt));
-                }
-            }
-        }
-        return items;
+        return categories
+            .filter(cat => {
+                const catName = (cat.Name || '').toLowerCase();
+                return type === 'location'
+                    ? (catName.includes('location') || catName.includes('region') || catName.includes('department'))
+                    : (!catName.includes('location') && !catName.includes('region'));
+            })
+            .flatMap(cat => (cat.Options || []).map(opt => XeroMapper.toTrackingOptionDTO(opt)));
     }
 
     /**

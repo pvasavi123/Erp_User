@@ -3,7 +3,7 @@
 const AdminService = require('./service');
 const jwt = require('jsonwebtoken');
 const config = require('../../core/config');
-const { ValidationError, UnauthorizedError } = require('../../core/errors/AppError');
+const { AppError, ValidationError } = require('../../core/errors/AppError');
 
 /**
  * AdminController
@@ -45,7 +45,7 @@ class AdminController {
                 token
             });
         } catch (error) {
-            next(error instanceof Error && error.isOperational ? error : new UnauthorizedError(error.message));
+            next(error instanceof Error && error.isOperational ? error : new AppError(error.message, 401, 'ERR_UNAUTHORIZED'));
         }
     }
 

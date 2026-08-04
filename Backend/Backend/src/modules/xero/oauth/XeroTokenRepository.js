@@ -6,8 +6,13 @@ class XeroTokenRepository extends IOAuthTokenRepository {
         const token = await XeroToken.findOne({ where: { tenant_id: tenantId } });
         if (!token) return null;
 
-        // Calculate expires_at dynamically from updatedAt (underscored: true -> updated_at)
-        const expiresAt = new Date(token.updated_at.getTime() + token.expires_in * 1000);
+        // Calculate expires_at dynamically from updatedAt. Note: the XeroToken
+        // model uses `underscored: true` without renaming the timestamp
+        // attributes themselves (unlike QuickBooksToken, which explicitly
+        // maps createdAt/updatedAt -> created_at/updated_at). That means only
+        // the DB column is snake_case here — the JS-side instance property
+        // Sequelize exposes is still `updatedAt`, not `updated_at`.
+       const expiresAt = new Date(token.updatedAt.getTime() + 30 * 60 * 1000);
 
         return {
             accessToken: token.access_token,

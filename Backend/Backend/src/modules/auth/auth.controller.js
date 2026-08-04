@@ -5,7 +5,7 @@ const AuthValidation = require('./auth.validation');
 const UserRepository = require('./user.repository');
 const OAuthPopupView = require('./views/oauthPopup.view');
 const logger         = require('../../core/logger');
-const { ValidationError, UnauthorizedError, NotFoundError, InternalServerError } = require('../../core/errors/AppError');
+const { AppError, ValidationError } = require('../../core/errors/AppError');
 
 /**
  * AuthController
@@ -58,7 +58,7 @@ class AuthController {
                 user:    result.user
             });
         } catch (error) {
-            next(error instanceof Error && error.isOperational ? error : new UnauthorizedError(error.message));
+            next(error instanceof Error && error.isOperational ? error : new AppError(error.message, 401, 'ERR_UNAUTHORIZED'));
         }
     }
 
@@ -797,7 +797,7 @@ class AuthController {
         try {
             const user = await UserRepository.findById(req.user.userId);
             if (!user) {
-                throw new NotFoundError('User not found.');
+                throw new AppError('The requested resource was not found.', 404, 'ERR_NOT_FOUND', 'User not found.');
             }
             return res.json({
                 success: true,
@@ -811,7 +811,7 @@ class AuthController {
                 }
             });
         } catch (error) {
-            next(error instanceof Error && error.isOperational ? error : new InternalServerError(error.message));
+            next(error instanceof Error && error.isOperational ? error : new AppError('Something went wrong on our end. Please try again later.', 500, 'ERR_INTERNAL', error.message));
         }
     }
 
@@ -830,7 +830,7 @@ class AuthController {
             }
             return res.json({ success: true, message: 'Logged out.' });
         } catch (error) {
-            next(error instanceof Error && error.isOperational ? error : new InternalServerError(error.message));
+            next(error instanceof Error && error.isOperational ? error : new AppError('Something went wrong on our end. Please try again later.', 500, 'ERR_INTERNAL', error.message));
         }
     }
 
@@ -872,7 +872,7 @@ class AuthController {
 
             return res.json({ success: true, message: 'Plan updated successfully' });
         } catch (error) {
-            next(error instanceof Error && error.isOperational ? error : new InternalServerError(error.message));
+            next(error instanceof Error && error.isOperational ? error : new AppError('Something went wrong on our end. Please try again later.', 500, 'ERR_INTERNAL', error.message));
         }
     }
 }

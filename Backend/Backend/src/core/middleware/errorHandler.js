@@ -4,9 +4,7 @@ const logger = require('../logger');
 const {
     AppError,
     ConnectionRefusedError,
-    SessionExpiredError,
-    NotFoundError,
-    InternalServerError
+    SessionExpiredError
 } = require('../errors/AppError');
 
 // Node/axios/mysql2 error codes that mean "couldn't reach a dependency"
@@ -55,7 +53,12 @@ function normalize(err) {
 
     // Anything else is unexpected — treat as an internal error and never
     // leak the raw message/stack to the client.
-    return new InternalServerError((err && err.message) || 'Unknown error');
+    return new AppError(
+        'Something went wrong on our end. Please try again later.',
+        500,
+        'ERR_INTERNAL',
+        (err && err.message) || 'Unknown error'
+    );
 }
 
 /**
@@ -84,7 +87,12 @@ function errorHandler(err, req, res, next) {
 
 /** Mount right before errorHandler to turn unknown routes into a standard 404. */
 function notFoundHandler(req, res, next) {
-    next(new NotFoundError(`Route ${req.method} ${req.originalUrl} not found.`));
+    next(new AppError(
+        'The requested resource was not found.',
+        404,
+        'ERR_NOT_FOUND',
+        `Route ${req.method} ${req.originalUrl} not found.`
+    ));
 }
 
 module.exports = { errorHandler, notFoundHandler, normalize };

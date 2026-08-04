@@ -1,4 +1,4 @@
-const { ErpSessionExpiredError, ErpRefreshFailedError } = require('../../errors/AppError');
+const { AppError, ErpSessionExpiredError } = require('../../errors/AppError');
 
 /** Capitalizes a provider key ('quickbooks' -> 'QuickBooks', 'xero' -> 'Xero') for user-facing text. */
 function displayName(provider) {
@@ -28,11 +28,12 @@ class OAuthTokenRevokedError extends ErpSessionExpiredError {
 /**
  * Thrown for network failures, provider outages, or transient errors during
  * refresh — NOT a revoked connection, so the user isn't asked to reconnect.
- * Maps to ErpRefreshFailedError (502, ERR_ERP_REFRESH_FAILED).
+ * 502, ERR_ERP_REFRESH_FAILED.
  */
-class OAuthTokenRefreshError extends ErpRefreshFailedError {
+class OAuthTokenRefreshError extends AppError {
     constructor(message = 'Failed to refresh OAuth token.', provider, originalError = null) {
-        super(displayName(provider), message);
+        const name = displayName(provider);
+        super(`Could not reach ${name}. Please try again shortly.`, 502, 'ERR_ERP_REFRESH_FAILED', message);
         this.provider = provider;
         this.originalError = originalError;
     }

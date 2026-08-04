@@ -96,15 +96,13 @@ class QuickBooksService {
 
         if (token) {
             realmId = token.companyId || token.realm_id;
-            try {
-                accessToken = await QuickBooksTokenManager.getValidToken(realmId);
-            } catch (err) {
-                if (token.access_token || token.accessToken) {
-                    accessToken = token.access_token || token.accessToken;
-                } else {
-                    throw err;
-                }
-            }
+            // Always go through QuickBooksTokenManager rather than falling
+            // back to token.access_token/accessToken on failure. That token
+            // is precisely the one getValidToken() just decided was
+            // expiring/expired — silently using it anyway would mean a
+            // failed/refused refresh (revoked connection) gets masked as a
+            // doomed API call instead of surfacing as "Reconnect" here.
+            accessToken = await QuickBooksTokenManager.getValidToken(realmId);
         } else {
             const connections = await QuickBooksTokenRepository.getActiveTokens();
             const activeToken = connections[0];
@@ -150,20 +148,19 @@ class QuickBooksService {
      * @returns {Promise<{ QueryResponse: Object }>}
      */
     static async queryAll(entityName, token, batchSize = 1000) {
-        const allRecords = [];
-        let startPosition = 1;
-
-        while (true) {
+        const fetchBatch = async (startPosition) => {
             const query = `SELECT * FROM ${entityName} STARTPOSITION ${startPosition} MAXRESULTS ${batchSize}`;
             const raw = await QuickBooksService.executeQuery(query, token);
             const batch = raw?.QueryResponse?.[entityName] || [];
 
-            allRecords.push(...batch);
+            if (batch.length < batchSize) {
+                return batch;
+            }
+            const nextBatch = await fetchBatch(startPosition + batchSize);
+            return batch.concat(nextBatch);
+        };
 
-            if (batch.length < batchSize) break;
-            startPosition += batchSize;
-        }
-
+        const allRecords = await fetchBatch(1);
         return { QueryResponse: { [entityName]: allRecords } };
     }
 
@@ -185,17 +182,19 @@ class QuickBooksService {
         const tokens = await QuickBooksTokenRepository.getActiveTokens();
         if (!tokens || tokens.length === 0) return null;
 
-        const companies = [];
-        for (const t of tokens) {
+        const companyResults = await Promise.all(tokens.map(async (t) => {
             try {
                 const raw = await QuickBooksService.executeQuery('SELECT * FROM CompanyInfo', t);
                 const info = QuickBooksMapper.toCompanyInfo(raw);
                 if (info) {
                     info.id = t.companyId;
-                    companies.push(info);
+                    return info;
                 }
             } catch (err) {}
-        }
+            return null;
+        }));
+
+        const companies = companyResults.filter(Boolean);
         return companies.length === 1 ? companies[0] : companies;
     }
 
@@ -218,24 +217,23 @@ class QuickBooksService {
      */
     static async getCustomers() {
         const tokens = await QuickBooksTokenRepository.getActiveTokens();
-        let allCustomers = [];
-
-        for (const token of tokens) {
+        const results = await Promise.all(tokens.map(async (token) => {
             try {
                 const raw = await QuickBooksService.queryAll('Customer', token);
                 const list = QuickBooksMapper.toCustomerList(raw);
-                const { orgId, orgName } = await QuickBooksService.getCompanyMetadata(token);
-                for (const c of list) {
-                    c.clientId   = orgName; // Keep clientName & clientId identical
-                    c.clientName = orgName;
-                    allCustomers.push(c);
-                }
+                const { orgName } = await QuickBooksService.getCompanyMetadata(token);
+                return list.map(c => ({
+                    ...c,
+                    clientId: orgName,
+                    clientName: orgName
+                }));
             } catch (err) {
                 const realmId = token.companyId || token.realm_id;
                 logger.error(`Error getting customers for realm ${realmId}:`, err.message);
+                return [];
             }
-        }
-        return allCustomers;
+        }));
+        return results.flat();
     }
 
     /**
@@ -244,24 +242,23 @@ class QuickBooksService {
      */
     static async getVendors() {
         const tokens = await QuickBooksTokenRepository.getActiveTokens();
-        let allVendors = [];
-
-        for (const token of tokens) {
+        const results = await Promise.all(tokens.map(async (token) => {
             try {
                 const raw = await QuickBooksService.queryAll('Vendor', token);
                 const list = QuickBooksMapper.toVendorList(raw);
-                const { orgId, orgName } = await QuickBooksService.getCompanyMetadata(token);
-                for (const v of list) {
-                    v.clientId   = orgName; // Keep clientName & clientId identical
-                    v.clientName = orgName;
-                    allVendors.push(v);
-                }
+                const { orgName } = await QuickBooksService.getCompanyMetadata(token);
+                return list.map(v => ({
+                    ...v,
+                    clientId: orgName,
+                    clientName: orgName
+                }));
             } catch (err) {
                 const realmId = token.companyId || token.realm_id;
                 logger.error(`Error getting vendors for realm ${realmId}:`, err.message);
+                return [];
             }
-        }
-        return allVendors;
+        }));
+        return results.flat();
     }
 
     /**
@@ -270,24 +267,23 @@ class QuickBooksService {
      */
     static async getAccounts() {
         const tokens = await QuickBooksTokenRepository.getActiveTokens();
-        let allAccounts = [];
-
-        for (const token of tokens) {
+        const results = await Promise.all(tokens.map(async (token) => {
             try {
                 const raw = await QuickBooksService.queryAll('Account', token);
                 const list = QuickBooksMapper.toAccountList(raw);
-                const { orgId, orgName } = await QuickBooksService.getCompanyMetadata(token);
-                for (const a of list) {
-                    a.clientId   = orgName; // Keep clientName & clientId identical
-                    a.clientName = orgName;
-                    allAccounts.push(a);
-                }
+                const { orgName } = await QuickBooksService.getCompanyMetadata(token);
+                return list.map(a => ({
+                    ...a,
+                    clientId: orgName,
+                    clientName: orgName
+                }));
             } catch (err) {
                 const realmId = token.companyId || token.realm_id;
                 logger.error(`Error getting accounts for realm ${realmId}:`, err.message);
+                return [];
             }
-        }
-        return allAccounts;
+        }));
+        return results.flat();
     }
 
     /**
@@ -296,24 +292,23 @@ class QuickBooksService {
      */
     static async getClasses() {
         const tokens = await QuickBooksTokenRepository.getActiveTokens();
-        let allClasses = [];
-
-        for (const token of tokens) {
+        const results = await Promise.all(tokens.map(async (token) => {
             try {
                 const raw = await QuickBooksService.queryAll('Class', token);
                 const list = QuickBooksMapper.toClassList(raw);
-                const { orgId, orgName } = await QuickBooksService.getCompanyMetadata(token);
-                for (const c of list) {
-                    c.clientId   = orgName; // Keep clientName & clientId identical
-                    c.clientName = orgName;
-                    allClasses.push(c);
-                }
+                const { orgName } = await QuickBooksService.getCompanyMetadata(token);
+                return list.map(c => ({
+                    ...c,
+                    clientId: orgName,
+                    clientName: orgName
+                }));
             } catch (err) {
                 const realmId = token.companyId || token.realm_id;
                 logger.error(`Error getting classes for realm ${realmId}:`, err.message);
+                return [];
             }
-        }
-        return allClasses;
+        }));
+        return results.flat();
     }
 
     /**
@@ -322,24 +317,23 @@ class QuickBooksService {
      */
     static async getLocations() {
         const tokens = await QuickBooksTokenRepository.getActiveTokens();
-        let allLocations = [];
-
-        for (const token of tokens) {
+        const results = await Promise.all(tokens.map(async (token) => {
             try {
                 const raw = await QuickBooksService.queryAll('Department', token);
                 const list = QuickBooksMapper.toLocationList(raw);
-                const { orgId, orgName } = await QuickBooksService.getCompanyMetadata(token);
-                for (const l of list) {
-                    l.clientId   = orgName; // Keep clientName & clientId identical
-                    l.clientName = orgName;
-                    allLocations.push(l);
-                }
+                const { orgName } = await QuickBooksService.getCompanyMetadata(token);
+                return list.map(l => ({
+                    ...l,
+                    clientId: orgName,
+                    clientName: orgName
+                }));
             } catch (err) {
                 const realmId = token.companyId || token.realm_id;
                 logger.error(`Error getting departments for realm ${realmId}:`, err.message);
+                return [];
             }
-        }
-        return allLocations;
+        }));
+        return results.flat();
     }
 
     // ── Self-contained Connections Management & Pulling ────────────────
@@ -422,22 +416,14 @@ class QuickBooksService {
             platform:     'quickbooks',
             companyId:    t.realm_id,
             companyName:  t.company_name || 'QuickBooks Company',
-            accessToken:  t.access_token,
-            refreshToken: t.refresh_token,
-            realm_id:     t.realm_id,
-            access_token: t.access_token
+            realm_id:     t.realm_id
         }));
 
-        const aggregated = { company: [], customers: [], vendors: [], accounts: [], classes: [], locations: [] };
-
-        for (const token of tokens) {
+        const results = await Promise.all(tokens.map(async (token) => {
             try {
                 const rawComp = await QuickBooksService.executeQuery('SELECT * FROM CompanyInfo', token);
                 const comp = QuickBooksMapper.toCompanyInfo(rawComp);
-                if (comp) {
-                    comp.id = token.companyId;
-                    aggregated.company.push(comp);
-                }
+                const companyList = comp ? [{ ...comp, id: token.companyId }] : [];
 
                 const [rawCust, rawVend, rawAcc, rawClass, rawLoc] = await Promise.all([
                     QuickBooksService.queryAll('Customer', token),
@@ -450,16 +436,19 @@ class QuickBooksService {
                 const orgName = comp?.name || comp?.legalName || token.companyName;
                 const tag = (list) => list.map(i => ({ ...i, clientId: orgName, clientName: orgName }));
 
-                aggregated.customers.push(...tag(QuickBooksMapper.toCustomerList(rawCust)));
-                aggregated.vendors.push(...tag(QuickBooksMapper.toVendorList(rawVend)));
-                aggregated.accounts.push(...tag(QuickBooksMapper.toAccountList(rawAcc)));
-                aggregated.classes.push(...tag(QuickBooksMapper.toClassList(rawClass)));
-                aggregated.locations.push(...tag(QuickBooksMapper.toLocationList(rawLoc)));
-
                 await QuickBooksToken.update(
                     { last_synced_at: new Date(), status: 'Active' },
                     { where: { realm_id: token.companyId } }
                 );
+
+                return {
+                    company: companyList,
+                    customers: tag(QuickBooksMapper.toCustomerList(rawCust)),
+                    vendors: tag(QuickBooksMapper.toVendorList(rawVend)),
+                    accounts: tag(QuickBooksMapper.toAccountList(rawAcc)),
+                    classes: tag(QuickBooksMapper.toClassList(rawClass)),
+                    locations: tag(QuickBooksMapper.toLocationList(rawLoc))
+                };
             } catch (err) {
                 logger.error(`Error pulling QB data for connection ${token.companyId}:`, err.message);
 
@@ -480,9 +469,16 @@ class QuickBooksService {
 
                 throw err;
             }
-        }
+        }));
 
-        return aggregated;
+        return results.reduce((acc, curr) => ({
+            company: [...acc.company, ...curr.company],
+            customers: [...acc.customers, ...curr.customers],
+            vendors: [...acc.vendors, ...curr.vendors],
+            accounts: [...acc.accounts, ...curr.accounts],
+            classes: [...acc.classes, ...curr.classes],
+            locations: [...acc.locations, ...curr.locations]
+        }), { company: [], customers: [], vendors: [], accounts: [], classes: [], locations: [] });
     }
 }
 

@@ -1,7 +1,7 @@
 'use strict';
 
 const eventBus = require('../../core/events');
-const { ValidationError, NotFoundError } = require('../../core/errors/AppError');
+const { AppError, ValidationError } = require('../../core/errors/AppError');
 
 /**
  * BillingService
@@ -64,7 +64,7 @@ class BillingService {
 
         const user = await this.userRepository.findById(userId);
         if (!user) {
-            throw new NotFoundError('User not found.');
+            throw new AppError('The requested resource was not found.', 404, 'ERR_NOT_FOUND', 'User not found.');
         }
 
         // No prior plan means this is the user's first-ever plan
@@ -96,7 +96,7 @@ class BillingService {
 
         const user = await this.userRepository.findByEmail(email);
         if (!user) {
-            throw new NotFoundError('User not found.');
+            throw new AppError('The requested resource was not found.', 404, 'ERR_NOT_FOUND', 'User not found.');
         }
 
         // No prior plan means this is the user's first-ever plan

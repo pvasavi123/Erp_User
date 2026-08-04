@@ -220,27 +220,42 @@ Office.onReady(() => {
         /**
          * Checks subscription status for the given email from backend.
          * Also stores the JWT token if the server returns one.
-         * Falls back gracefully if backend is down (for UI-only phase).
+         *
+         * If the backend is unreachable (no internet / server down), this
+         * surfaces the same offline banner + Retry action as every other
+         * call in the app instead of failing silently — the caller still
+         * gets a graceful fallback value so existing view-routing logic
+         * keeps working, but the user now sees *why*.
          */
         async checkSubscription(email) {
+            let res;
             try {
-                const res = await fetch(`${this.BASE}/api/auth/login`, {
+                res = await fetch(`${this.BASE}/api/auth/login`, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ email })
                 });
-                if (!res.ok) return { hasSubscription: false };
-                const result = await res.json();
-                // Persist the token if the backend returned one
-                if (result.token) {
-                    AppState.jwtToken = result.token;
-                    AppState.sessionExpired = false; // fresh token — lift the request block
-                    localStorage.setItem("fa_jwt_token", result.token);
-                }
-                return result;
-            } catch {
+            } catch (networkErr) {
+                const apiErr = networkError(networkErr);
+                this.handleGlobalApiError(apiErr, { retry: () => this.checkSubscription(email) });
                 return { hasSubscription: AppState.hasSubscription };
             }
+
+            if (!res.ok) {
+                const apiErr = await parseApiError(res.clone());
+                this.handleGlobalApiError(apiErr);
+                return { hasSubscription: false };
+            }
+
+            const result = await res.json();
+            // Persist the token if the backend returned one
+            if (result.token) {
+                AppState.jwtToken = result.token;
+                AppState.sessionExpired = false; // fresh token — lift the request block
+                localStorage.setItem("fa_jwt_token", result.token);
+            }
+            hideBanner();
+            return result;
         },
 
         /** Checks ERP token validity from backend (JWT required). */
@@ -351,10 +366,10 @@ Office.onReady(() => {
                 };
 
                 // 1. Group Companies
-                const rawCompanies = Array.isArray(data.company) 
-                    ? data.company 
+                const rawCompanies = Array.isArray(data.company)
+                    ? data.company
                     : (data.company ? [data.company] : []);
-                
+
                 for (const c of rawCompanies) {
                     if (c) getOrCreateGroup(c.name || c.id, c.name);
                 }
@@ -764,6 +779,10 @@ Office.onReady(() => {
             if (!popup || popup.closed) {
                 window.removeEventListener("message", msgHandler);
                 DashboardService.showError("Popup was blocked. Please allow popups and try again.");
+            } else {
+                // Bring the popup to the front — without this it can open
+                // behind the taskpane/main window in some browsers.
+                popup.focus();
             }
         },
 
@@ -815,6 +834,10 @@ Office.onReady(() => {
             if (!popup || popup.closed) {
                 window.removeEventListener("message", msgHandler);
                 DashboardService.showError("Popup was blocked. Please allow popups and try again.");
+            } else {
+                // Bring the popup to the front — without this it can open
+                // behind the taskpane/main window in some browsers.
+                popup.focus();
             }
         },
 
@@ -910,6 +933,8 @@ Office.onReady(() => {
             if (!popup || popup.closed) {
                 window.removeEventListener("message", msgHandler);
                 DashboardService.showError("Checkout popup was blocked. Please allow popups.");
+            } else {
+                popup.focus();
             }
         },
 
@@ -2537,13 +2562,13 @@ Office.onReady(() => {
                 try {
                     DashboardService.addLog(`Refreshing live data from ${AppState.currentProvider === "quickbooks" ? "QuickBooks" : "Xero"}...`);
                     DashboardService.showStatus("Refreshing...", "success");
-                    
+
                     const data = await ApiService.fetchMasterData(AppState.currentProvider, AppState.currentCompanyId);
                     await ExcelService.writeMasterData(AppState.currentProvider, data);
-                    
+
                     const timestamp = new Date().toLocaleTimeString();
                     await ExcelService.stampLastRefreshed(timestamp);
-                    
+
                     DashboardService.addLog("Live data refreshed and timestamp stamped successfully.");
                     DashboardService.showStatus("Updated successfully.", "success");
                 } catch (err) {
