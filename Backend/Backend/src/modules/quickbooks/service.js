@@ -416,7 +416,8 @@ class QuickBooksService {
             platform:     'quickbooks',
             companyId:    t.realm_id,
             companyName:  t.company_name || 'QuickBooks Company',
-            realm_id:     t.realm_id
+            realm_id:     t.realm_id,
+            lastSyncedAt: t.last_synced_at
         }));
 
         const results = await Promise.all(tokens.map(async (token) => {
@@ -443,11 +444,11 @@ class QuickBooksService {
 
                 return {
                     company: companyList,
-                    customers: tag(QuickBooksMapper.toCustomerList(rawCust)),
-                    vendors: tag(QuickBooksMapper.toVendorList(rawVend)),
-                    accounts: tag(QuickBooksMapper.toAccountList(rawAcc)),
-                    classes: tag(QuickBooksMapper.toClassList(rawClass)),
-                    locations: tag(QuickBooksMapper.toLocationList(rawLoc))
+                    customers: tag(QuickBooksMapper.toCustomerList(rawCust, token.lastSyncedAt)),
+                    vendors: tag(QuickBooksMapper.toVendorList(rawVend, token.lastSyncedAt)),
+                    accounts: tag(QuickBooksMapper.toAccountList(rawAcc, token.lastSyncedAt)),
+                    classes: tag(QuickBooksMapper.toClassList(rawClass, token.lastSyncedAt)),
+                    locations: tag(QuickBooksMapper.toLocationList(rawLoc, token.lastSyncedAt))
                 };
             } catch (err) {
                 logger.error(`Error pulling QB data for connection ${token.companyId}:`, err.message);

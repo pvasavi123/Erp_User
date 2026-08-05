@@ -20,7 +20,9 @@ describe('XeroMapper', () => {
                 email: 'jane@example.com',
                 phone: '123-456-7890',
                 isCustomer: true,
-                isSupplier: false
+                isSupplier: false,
+                isNew: false,
+                isUpdated: false
             });
         });
 
@@ -34,8 +36,55 @@ describe('XeroMapper', () => {
                 email: '',
                 phone: '',
                 isCustomer: false,
-                isSupplier: false
+                isSupplier: false,
+                isNew: false,
+                isUpdated: false
             });
+        });
+
+        it('should mark isNew=true when UpdatedDateUTC (ISO) is after lastSyncedAt', () => {
+            const rawContact = {
+                ContactID: 'X125',
+                Name: 'New Contact',
+                UpdatedDateUTC: '2024-06-15T10:00:00.000Z'
+            };
+            const dto = XeroMapper.toContactDTO(rawContact, '2024-06-01T00:00:00.000Z');
+
+            expect(dto.isNew).toBe(true);
+        });
+
+        it('should mark isNew=true when UpdatedDateUTC (.NET date format) is after lastSyncedAt', () => {
+            const rawContact = {
+                ContactID: 'X126',
+                Name: 'New Contact Net Date',
+                UpdatedDateUTC: '/Date(1718443200000+0000)/' // 2024-06-15T10:40:00Z
+            };
+            const dto = XeroMapper.toContactDTO(rawContact, '2024-06-01T00:00:00.000Z');
+
+            expect(dto.isNew).toBe(true);
+        });
+
+        it('should mark isNew=false when there is no prior sync to compare against', () => {
+            const rawContact = {
+                ContactID: 'X127',
+                Name: 'First Pull Contact',
+                UpdatedDateUTC: '2024-06-15T10:00:00.000Z'
+            };
+            const dto = XeroMapper.toContactDTO(rawContact, null);
+
+            expect(dto.isNew).toBe(false);
+        });
+
+        it('should always report isUpdated=false (Xero has no separate creation timestamp to distinguish new vs. updated)', () => {
+            const rawContact = {
+                ContactID: 'X128',
+                Name: 'Changed Contact',
+                UpdatedDateUTC: '2024-06-15T10:00:00.000Z'
+            };
+            const dto = XeroMapper.toContactDTO(rawContact, '2024-06-01T00:00:00.000Z');
+
+            expect(dto.isNew).toBe(true);
+            expect(dto.isUpdated).toBe(false);
         });
     });
 
@@ -61,7 +110,9 @@ describe('XeroMapper', () => {
                 active: 'Active',
                 description: 'Product Sales',
                 classification: 'Revenue',
-                fullyQualifiedName: 'Sales'
+                fullyQualifiedName: 'Sales',
+                isNew: false,
+                isUpdated: false
             });
         });
     });

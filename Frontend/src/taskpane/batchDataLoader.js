@@ -1,6 +1,43 @@
 const DEFAULT_BATCH_SIZE = 100;
 const DEFAULT_WRITE_BATCH_SIZE = 20;
 
+// Background fill applied to rows flagged as newly added since the last
+// Master Data Pull. Previously existing rows are left with the default
+// (no fill) background.
+const NEW_RECORD_FILL_COLOR = "#D9D9D9";
+
+/**
+ * Applies (or clears) the "new record" highlight fill across a block of
+ * rows, grouping consecutive rows that share the same isNew flag into a
+ * single range.format call rather than one per row.
+ *
+ * @param {Excel.Worksheet} sheet
+ * @param {string} startColumn
+ * @param {string} endColumn
+ * @param {number} batchStartRow - absolute row number of flags[0]
+ * @param {boolean[]} flags
+ */
+function applyNewRecordHighlighting(sheet, startColumn, endColumn, batchStartRow, flags) {
+  let i = 0;
+  while (i < flags.length) {
+    const flagValue = !!flags[i];
+    let j = i;
+    while (j < flags.length && !!flags[j] === flagValue) j++;
+
+    const rangeStartRow = batchStartRow + i;
+    const rangeEndRow = batchStartRow + j - 1;
+    const range = sheet.getRange(`${startColumn}${rangeStartRow}:${endColumn}${rangeEndRow}`);
+
+    if (flagValue) {
+      range.format.fill.color = NEW_RECORD_FILL_COLOR;
+    } else {
+      range.format.fill.clear();
+    }
+
+    i = j;
+  }
+}
+
 /**
  * @param {Excel.RequestContext} context
  * @param {Excel.Worksheet} sheet
@@ -8,6 +45,7 @@ const DEFAULT_WRITE_BATCH_SIZE = 20;
  * @param {string} endColumn
  * @param {number} startRow
  * @param {any[][]} rows
+ * @param {boolean[]|null} [isNewFlags=null] - one boolean per row; true rows get the "new record" fill, false/missing rows get the default (no fill) background
  * @param {number} [batchSize=20]
  */
 export async function writeRowsInBatches(
@@ -17,6 +55,7 @@ export async function writeRowsInBatches(
   endColumn,
   startRow,
   rows,
+  isNewFlags = null,
   batchSize = DEFAULT_WRITE_BATCH_SIZE
 ) {
   if (!rows || rows.length === 0) return;
@@ -30,6 +69,17 @@ export async function writeRowsInBatches(
     try {
       const range = sheet.getRange(`${startColumn}${batchStartRow}:${endColumn}${batchEndRow}`);
       range.values = batchData;
+
+      if (Array.isArray(isNewFlags)) {
+        applyNewRecordHighlighting(
+          sheet,
+          startColumn,
+          endColumn,
+          batchStartRow,
+          isNewFlags.slice(offset, offset + batchData.length)
+        );
+      }
+
       await context.sync();
     } catch (error) {
       throw new Error(

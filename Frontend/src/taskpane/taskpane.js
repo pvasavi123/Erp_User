@@ -330,6 +330,38 @@ Office.onReady(() => {
     // 4. EXCEL SERVICE LAYER
     // ============================================================
 
+    /**
+     * A record counts as "changed since the last sync" if it's either
+     * newly added (isNew) or a pre-existing record that was modified
+     * (isUpdated). Both are treated identically for display purposes:
+     * moved to the bottom of the sheet and highlighted.
+     * @param {{isNew?: boolean, isUpdated?: boolean}} item
+     * @returns {boolean}
+     */
+    function isChangedRecord(item) {
+        return !!(item.isNew || item.isUpdated);
+    }
+
+    /**
+     * Reorders a list so unchanged existing records keep their original
+     * relative order and are written first (default background, same
+     * position), with new-or-updated records appended after them —
+     * also preserving their own relative order. Array.prototype.filter
+     * preserves order, so changed records are never interleaved among
+     * the unchanged ones.
+     *
+     * When nothing has changed, this is a no-op: the list comes back in
+     * its original order and every row keeps the default background.
+     *
+     * @param {Array<{isNew?: boolean, isUpdated?: boolean}>} list
+     * @returns {Array}
+     */
+    function partitionExistingThenNew(list) {
+        const unchanged = list.filter(item => !isChangedRecord(item));
+        const changed = list.filter(item => isChangedRecord(item));
+        return unchanged.concat(changed);
+    }
+
     const ExcelService = {
         /**
          * Populates Excel workbook sheet "1.Master_Data" with ERP payload.
@@ -340,9 +372,13 @@ Office.onReady(() => {
             await Excel.run(async (context) => {
                 const sheet = context.workbook.worksheets.getItem("1.Master_Data");
 
-                // Clear existing records in spreadsheet grid below headers
+                // Clear existing records in spreadsheet grid below headers.
+                // "All" (not just "Contents") is required so any "new record"
+                // highlight fill from a previous refresh doesn't linger on
+                // rows that are no longer new — font size/wrap and column
+                // width are reapplied unconditionally below anyway.
                 const clearRange = sheet.getRange("A2:AB10000");
-                clearRange.clear("Contents");
+                clearRange.clear("All");
 
                 // Group all data by Organization
                 const orgGroupsMap = new Map();
@@ -411,7 +447,9 @@ Office.onReady(() => {
                             name: cust.name || cust.DisplayName || cust.Name || "",
                             type: "Customer",
                             id: cust.id || cust.Id || cust.ContactID || "",
-                            status: cust.active !== undefined ? (cust.active ? "Active" : "Inactive") : "Active"
+                            status: cust.active !== undefined ? (cust.active ? "Active" : "Inactive") : "Active",
+                            isNew: !!cust.isNew,
+                            isUpdated: !!cust.isUpdated
                         });
                     }
                 }
@@ -425,7 +463,9 @@ Office.onReady(() => {
                             name: vend.name || vend.DisplayName || vend.Name || "",
                             type: "Vendor",
                             id: vend.id || vend.Id || vend.ContactID || "",
-                            status: vend.active !== undefined ? (vend.active ? "Active" : "Inactive") : "Active"
+                            status: vend.active !== undefined ? (vend.active ? "Active" : "Inactive") : "Active",
+                            isNew: !!vend.isNew,
+                            isUpdated: !!vend.isUpdated
                         });
                     }
                 }
@@ -450,7 +490,12 @@ Office.onReady(() => {
                     // MASTER_DATA_WRITE_BATCH_SIZE rows so large chart-of-accounts
                     // payloads don't sit in memory as one giant pending write.
                     if (accCount > 0) {
-                        const accValues = group.accounts.map(a => [
+                        // Unchanged accounts keep their original order and
+                        // default background; new-or-updated ones are moved
+                        // to the bottom and highlighted — never interleaved
+                        // in the middle of the existing rows.
+                        const orderedAccounts = partitionExistingThenNew(group.accounts);
+                        const accValues = orderedAccounts.map(a => [
                             orgName,
                             a.acctNum || a.code || a.AcctNum || a.Code || "",
                             a.name || a.Name || "",
@@ -461,42 +506,49 @@ Office.onReady(() => {
                             a.active !== undefined ? (a.active ? "Active" : "Inactive") : "Active",
                             a.id || a.Id || a.AccountID || ""
                         ]);
-                        await writeRowsInBatches(context, sheet, "D", "L", currentRow, accValues);
+                        const accHighlightFlags = orderedAccounts.map(isChangedRecord);
+                        await writeRowsInBatches(context, sheet, "D", "L", currentRow, accValues, accHighlightFlags);
                     }
 
                     // Section 3 (N:Q) - Classes, batched the same way.
                     if (classCount > 0) {
-                        const classValues = group.classes.map(c => [
+                        const orderedClasses = partitionExistingThenNew(group.classes);
+                        const classValues = orderedClasses.map(c => [
                             orgName,
                             c.name || c.Name || "",
                             c.id || c.Id || "",
                             c.active !== undefined ? (c.active ? "Active" : "Inactive") : "Active"
                         ]);
-                        await writeRowsInBatches(context, sheet, "N", "Q", currentRow, classValues);
+                        const classHighlightFlags = orderedClasses.map(isChangedRecord);
+                        await writeRowsInBatches(context, sheet, "N", "Q", currentRow, classValues, classHighlightFlags);
                     }
 
                     // Section 4 (S:V) - Locations, batched the same way.
                     if (locCount > 0) {
-                        const locValues = group.locations.map(l => [
+                        const orderedLocations = partitionExistingThenNew(group.locations);
+                        const locValues = orderedLocations.map(l => [
                             orgName,
                             l.name || l.Name || "",
                             l.id || l.Id || "",
                             l.active !== undefined ? (l.active ? "Active" : "Inactive") : "Active"
                         ]);
-                        await writeRowsInBatches(context, sheet, "S", "V", currentRow, locValues);
+                        const locHighlightFlags = orderedLocations.map(isChangedRecord);
+                        await writeRowsInBatches(context, sheet, "S", "V", currentRow, locValues, locHighlightFlags);
                     }
 
                     // Section 5 (X:AB) - Entities (Customers + Vendors), the
                     // section most likely to be large, batched the same way.
                     if (entityCount > 0) {
-                        const entityValues = group.entities.map(e => [
+                        const orderedEntities = partitionExistingThenNew(group.entities);
+                        const entityValues = orderedEntities.map(e => [
                             orgName,
                             e.name,
                             e.type,
                             e.id,
                             e.status
                         ]);
-                        await writeRowsInBatches(context, sheet, "X", "AB", currentRow, entityValues);
+                        const entityHighlightFlags = orderedEntities.map(isChangedRecord);
+                        await writeRowsInBatches(context, sheet, "X", "AB", currentRow, entityValues, entityHighlightFlags);
                     }
 
                     // Advance currentRow by maxRows + 2 (providing 2 empty row spaces between organizations!)

@@ -444,7 +444,8 @@ class XeroService {
             platform:    'xero',
             companyId:   t.tenant_id,
             companyName: t.company_name || 'Xero Organisation',
-            tenant_id:   t.tenant_id
+            tenant_id:   t.tenant_id,
+            lastSyncedAt: t.last_synced_at
         }));
 
         const results = await Promise.all(tokens.map(async (token) => {
@@ -514,10 +515,10 @@ class XeroService {
 
                 const companyList = company ? [{ ...company, id: token.companyId }] : [];
 
-                const contacts  = contactRes ? XeroMapper.toContactList(contactRes.data) : [];
-                const accounts  = accRes     ? XeroMapper.toAccountList(accRes.data)     : [];
-                const classes   = classRes   ? XeroMapper.toTrackingList(classRes.data, 'class')    : [];
-                const locations = classRes   ? XeroMapper.toTrackingList(classRes.data, 'location') : [];
+                const contacts  = contactRes ? XeroMapper.toContactList(contactRes.data, token.lastSyncedAt) : [];
+                const accounts  = accRes     ? XeroMapper.toAccountList(accRes.data, token.lastSyncedAt)     : [];
+                const classes   = classRes   ? XeroMapper.toTrackingList(classRes.data, 'class', token.lastSyncedAt)    : [];
+                const locations = classRes   ? XeroMapper.toTrackingList(classRes.data, 'location', token.lastSyncedAt) : [];
 
                 const tag = items => items.map(i => ({ ...i, clientId: orgName, clientName: orgName }));
 
