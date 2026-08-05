@@ -105,11 +105,14 @@ class XeroController {
             req.session.xero_pending_tenants = tenants;
             req.session.xero_pending_mail    = mail;
 
-            // Fetch existing active tokens for user to pre-check already connected companies
+            // Fetch existing connected tokens (Active or Not Synced — i.e.
+            // anything short of Disconnected) to pre-check already
+            // connected companies on the selection screen.
             const { XeroToken } = require('../../core/database');
+            const { Op } = require('sequelize');
             const whereClause = mail ? { mail } : {};
             const existingActive = await XeroToken.findAll({
-                where: { ...whereClause, status: 'Active' }
+                where: { ...whereClause, status: { [Op.ne]: 'Disconnected' } }
             });
             const activeTenantIds = new Set(existingActive.map(t => t.tenant_id));
 

@@ -35,8 +35,7 @@ class QuickBooksTokenRepository extends IOAuthTokenRepository {
         const updatePayload = {
             access_token:  accessToken,
             refresh_token: refreshToken,
-            expires_in:    expiresIn,
-            status:        'Active'
+            expires_in:    expiresIn
         };
 
         // Persist the refresh token lifetime when provided by the OAuth response
@@ -47,6 +46,16 @@ class QuickBooksTokenRepository extends IOAuthTokenRepository {
         await QuickBooksToken.update(updatePayload, {
             where: { realm_id: realmId }
         });
+
+        // Recovering from 'Disconnected' re-activates the connection once a
+        // refresh succeeds. But a connection that hasn't had its first
+        // successful Master Data Pull yet must stay 'Not Synced' — merely
+        // refreshing an access token isn't a sync, so it's excluded here.
+        const { Op } = require('sequelize');
+        await QuickBooksToken.update(
+            { status: 'Active' },
+            { where: { realm_id: realmId, status: { [Op.ne]: 'Not Synced' } } }
+        );
     }
 
     async markDisconnected(realmId) {

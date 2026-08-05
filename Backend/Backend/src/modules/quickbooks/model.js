@@ -40,8 +40,11 @@ module.exports = (sequelize) => {
             defaultValue: 'QuickBooks Company'
         },
         status: {
+            // 'Not Synced' until the first successful Master Data Pull sets
+            // it to 'Active' (see QuickBooksService.pullMasterData);
+            // 'Disconnected' once the user disconnects or a refresh fails.
             type: DataTypes.STRING(20),
-            defaultValue: 'Active'
+            defaultValue: 'Not Synced'
         },
         last_synced_at: {
             type: DataTypes.DATE,

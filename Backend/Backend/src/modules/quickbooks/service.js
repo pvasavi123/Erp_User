@@ -80,7 +80,10 @@ class QuickBooksService {
             session_info: sessionInfo,
             mail: mail,
             company_name: companyName,
-            status: 'Active'
+            // A freshly connected company hasn't had a Master Data Pull yet,
+            // so it starts "Not Synced" rather than "Active" — pullMasterData
+            // flips it to 'Active' once the first pull succeeds.
+            status: 'Not Synced'
         });
     }
 
@@ -353,7 +356,7 @@ class QuickBooksService {
             platform:     'QuickBooks',
             companyName:  t.company_name || 'QuickBooks Company',
             companyId:    t.realm_id,
-            status:       t.status || 'Active',
+            status:       t.status || 'Not Synced',
             lastSyncedAt: t.last_synced_at || t.updated_at || null,
             createdAt:    t.created_at || null
         }));
@@ -388,11 +391,23 @@ class QuickBooksService {
 
     static async activateConnection(companyId) {
         const { QuickBooksToken } = require('../../core/database');
+        const { Op } = require('sequelize');
+
+        // Selecting/switching to a connection re-activates it if it was
+        // 'Disconnected', but must not resurrect 'Not Synced' to 'Active' —
+        // that transition only happens via a successful Master Data Pull
+        // (see pullMasterData).
         const [updated] = await QuickBooksToken.update(
             { status: 'Active' },
-            { where: { realm_id: companyId } }
+            { where: { realm_id: companyId, status: { [Op.ne]: 'Not Synced' } } }
         );
-        return updated > 0;
+        if (updated > 0) return true;
+
+        // If nothing matched, the row might legitimately be 'Not Synced'
+        // (or simply not exist) — confirm it exists so the caller still
+        // gets a truthy result for "this company is now the active one".
+        const existing = await QuickBooksToken.findOne({ where: { realm_id: companyId } });
+        return !!existing;
     }
 
     static async renameConnection(companyId, companyName) {

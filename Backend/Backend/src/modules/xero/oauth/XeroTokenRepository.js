@@ -24,6 +24,7 @@ class XeroTokenRepository extends IOAuthTokenRepository {
 
     async saveToken(tenantId, { accessToken, refreshToken, expiresAt }) {
         const expiresIn = Math.max(0, Math.floor((expiresAt.getTime() - Date.now()) / 1000));
+        const { Op } = require('sequelize');
 
         // Note: Xero supports multi-tenancy. If multiple tenants are connected under the same
         // session/refresh flow, we must update the token for ALL records sharing the old refresh token.
@@ -33,20 +34,34 @@ class XeroTokenRepository extends IOAuthTokenRepository {
             await XeroToken.update({
                 access_token: accessToken,
                 refresh_token: refreshToken,
-                expires_in: expiresIn,
-                status: 'Active'
+                expires_in: expiresIn
             }, {
                 where: { refresh_token: currentToken.refresh_token }
+            });
+
+            // Recovering from 'Disconnected' re-activates the connection.
+            // A connection that hasn't had its first successful Master Data
+            // Pull yet stays 'Not Synced' even though its token was just
+            // refreshed — refreshing a token isn't the same as syncing data.
+            await XeroToken.update({
+                status: 'Active'
+            }, {
+                where: { refresh_token: refreshToken, status: { [Op.ne]: 'Not Synced' } }
             });
         } else {
             // Fallback for single tenant update
             await XeroToken.update({
                 access_token: accessToken,
                 refresh_token: refreshToken,
-                expires_in: expiresIn,
-                status: 'Active'
+                expires_in: expiresIn
             }, {
                 where: { tenant_id: tenantId }
+            });
+
+            await XeroToken.update({
+                status: 'Active'
+            }, {
+                where: { tenant_id: tenantId, status: { [Op.ne]: 'Not Synced' } }
             });
         }
     }

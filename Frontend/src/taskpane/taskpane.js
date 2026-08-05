@@ -10,6 +10,7 @@
  *  - ExcelService  : Excel JS workbook sheet management
  *  - AuthService   : Google / Microsoft OAuth popup handlers
  *  - DashboardService : Dashboard UI rendering and ERP operations
+ *  - NotificationService : Bell icon / drawer notification history
  *  - AppController : Event binding, session restoration, init
  */
 
@@ -95,6 +96,235 @@ Office.onReady(() => {
                 if (avatarEl) avatarEl.textContent = initial;
                 if (emailEl) emailEl.textContent = AppState.userEmail || "";
             }
+        }
+    };
+
+    // ============================================================
+    // NOTIFICATION SERVICE — Bell icon + drawer notification history
+    // ============================================================
+    const NotificationService = {
+        STORAGE_KEY: "fa_notifications",
+        MAX_ITEMS: 50,
+
+        /** @returns {Array<{id:string,type:'success'|'error',message:string,detail:string,timestamp:string,read:boolean}>} */
+        _load() {
+            try {
+                const raw = localStorage.getItem(this.STORAGE_KEY);
+                const parsed = raw ? JSON.parse(raw) : [];
+                return Array.isArray(parsed) ? parsed : [];
+            } catch (_) {
+                return [];
+            }
+        },
+
+        _save(list) {
+            try {
+                localStorage.setItem(this.STORAGE_KEY, JSON.stringify(list));
+            } catch (_) {
+                // Storage full/unavailable — notifications just won't persist
+                // across a refresh, but the app keeps working.
+            }
+        },
+
+        _escapeHtml(str) {
+            const div = document.createElement("div");
+            div.textContent = String(str == null ? "" : str);
+            return div.innerHTML;
+        },
+
+        _formatTimestamp(iso) {
+            const d = new Date(iso);
+            if (isNaN(d.getTime())) return "";
+            const now = new Date();
+            const timeStr = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+            if (d.toDateString() === now.toDateString()) return timeStr;
+            const dateStr = d.toLocaleDateString([], { month: "short", day: "numeric" });
+            return `${dateStr}, ${timeStr}`;
+        },
+
+        /**
+         * Records a new notification, shows it immediately as a top-right
+         * toast (the primary way the user learns an action succeeded or
+         * failed — the bell is just the persisted history, never required
+         * reading), and refreshes the bell badge. If the drawer happens to
+         * already be open, the new entry is shown there too and marked read.
+         * @param {string} message - short outcome, e.g. "Data pull completed successfully"
+         * @param {"success"|"error"} type
+         * @param {string} [detail] - optional second line, e.g. "Data synchronized successfully."
+         */
+        add(message, type, detail) {
+            if (!message) return;
+            const normalizedType = type === "error" ? "error" : "success";
+            const list = this._load();
+            list.unshift({
+                id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+                type: normalizedType,
+                message: String(message),
+                detail: detail ? String(detail) : "",
+                timestamp: new Date().toISOString(),
+                read: false
+            });
+            if (list.length > this.MAX_ITEMS) list.length = this.MAX_ITEMS;
+            this._save(list);
+
+            // Immediate feedback — always, regardless of whether the drawer
+            // is open or the bell has ever been clicked.
+            this.showToast(message, normalizedType, detail);
+
+            const drawer = document.getElementById("notifDrawer");
+            if (drawer && drawer.style.display !== "none") {
+                // Drawer is open — the new notification is on screen, so
+                // treat it as read immediately instead of leaving a stray
+                // unread badge behind an already-open drawer.
+                this.markAllRead();
+                this.renderDrawer();
+            } else {
+                this.renderBadge();
+            }
+        },
+
+        /**
+         * Renders a single floating, top-right toast card. Multiple toasts
+         * stack (most recent on top); each auto-dismisses on its own timer
+         * but can also be closed early via the × button.
+         * @param {string} message
+         * @param {"success"|"error"} type
+         * @param {string} [detail]
+         * @param {number} [duration=4500]
+         */
+        showToast(message, type, detail, duration = 4500) {
+            const container = document.getElementById("notifToastContainer");
+            if (!container) return;
+
+            const toastEl = document.createElement("div");
+            toastEl.className = `fa-notif-toast fa-notif-toast-${type === "error" ? "error" : "success"}`;
+            toastEl.innerHTML = `
+                <span class="fa-notif-toast-icon">${type === "error" ? "✕" : "✓"}</span>
+                <div class="fa-notif-toast-body">
+                    <div class="fa-notif-toast-title">${this._escapeHtml(message)}</div>
+                    ${detail ? `<div class="fa-notif-toast-detail">${this._escapeHtml(detail)}</div>` : ""}
+                </div>
+                <button class="fa-notif-toast-close" aria-label="Close">&times;</button>
+            `;
+            container.appendChild(toastEl);
+
+            let dismissTimer = null;
+            const removeToast = () => {
+                clearTimeout(dismissTimer);
+                toastEl.classList.add("fa-notif-toast-hide");
+                setTimeout(() => toastEl.remove(), 200);
+            };
+
+            toastEl.querySelector(".fa-notif-toast-close")?.addEventListener("click", removeToast);
+            dismissTimer = setTimeout(removeToast, duration);
+        },
+
+        getAll() {
+            return this._load();
+        },
+
+        getUnreadCount() {
+            return this._load().filter(n => !n.read).length;
+        },
+
+        markAllRead() {
+            const list = this._load();
+            let changed = false;
+            list.forEach(n => {
+                if (!n.read) {
+                    n.read = true;
+                    changed = true;
+                }
+            });
+            if (changed) this._save(list);
+            this.renderBadge();
+        },
+
+        /** Permanently deletes every notification from storage. */
+        clearAll() {
+            localStorage.removeItem(this.STORAGE_KEY);
+            this.renderBadge();
+            this.renderDrawer();
+        },
+
+        renderBadge() {
+            const badge = document.getElementById("notifBadge");
+            if (!badge) return;
+            const count = this.getUnreadCount();
+            if (count > 0) {
+                badge.textContent = count > 99 ? "99+" : String(count);
+                badge.style.display = "flex";
+            } else {
+                badge.style.display = "none";
+            }
+        },
+
+        renderDrawer() {
+            const listEl = document.getElementById("notifList");
+            if (!listEl) return;
+            const notifications = this.getAll();
+
+            if (notifications.length === 0) {
+                listEl.innerHTML = `<div class="fa-notif-empty">No notifications available.</div>`;
+                return;
+            }
+
+            listEl.innerHTML = notifications.map(n => {
+                const icon = n.type === "error" ? "✕" : "✓";
+                return `
+                    <div class="fa-notif-item fa-notif-item-${n.type === "error" ? "error" : "success"}">
+                        <span class="fa-notif-icon">${icon}</span>
+                        <div class="fa-notif-content">
+                            <div class="fa-notif-message">${this._escapeHtml(n.message)}</div>
+                            ${n.detail ? `<div class="fa-notif-detail">${this._escapeHtml(n.detail)}</div>` : ""}
+                            <div class="fa-notif-time">${this._formatTimestamp(n.timestamp)}</div>
+                        </div>
+                    </div>
+                `;
+            }).join("");
+        },
+
+        /** Wires up the bell button, drawer, and Clear All. Call once on init. */
+        init() {
+            this.renderBadge();
+
+            const drawer = () => document.getElementById("notifDrawer");
+
+            const toggleDrawer = (e) => {
+                e.stopPropagation();
+                const el = drawer();
+                if (!el) return;
+                const willOpen = el.style.display === "none";
+                el.style.display = willOpen ? "flex" : "none";
+                if (willOpen) {
+                    // Opening the drawer shows the full history and marks
+                    // everything read — the unread badge disappears.
+                    this.renderDrawer();
+                    this.markAllRead();
+                }
+            };
+            document.getElementById("notifBellBtn")?.addEventListener("click", toggleDrawer);
+
+            // Close the drawer when clicking anywhere outside it (or the bell).
+            document.addEventListener("click", (e) => {
+                const el = drawer();
+                const bell = document.getElementById("notifBellBtn");
+                if (el && el.style.display !== "none" && !el.contains(e.target) && !(bell && bell.contains(e.target))) {
+                    el.style.display = "none";
+                }
+            });
+
+            // Clear All — deletes immediately, no confirmation dialog, then
+            // closes the drawer. Stop propagation so this click doesn't
+            // also trigger the "click outside closes the drawer" listener
+            // above (that's a no-op here anyway since we close it
+            // ourselves, but keeps behavior explicit/predictable).
+            document.getElementById("notifClearAllBtn")?.addEventListener("click", (e) => {
+                e.stopPropagation();
+                this.clearAll();
+                const el = drawer();
+                if (el) el.style.display = "none";
+            });
         }
     };
 
@@ -360,6 +590,21 @@ Office.onReady(() => {
         const unchanged = list.filter(item => !isChangedRecord(item));
         const changed = list.filter(item => isChangedRecord(item));
         return unchanged.concat(changed);
+    }
+
+    /**
+     * Counts new-or-updated records across an entire Master Data Pull
+     * response, used to enrich the "pull succeeded" status/notification
+     * message with e.g. "3 new/updated records found".
+     * @param {object} data - Master data payload (accounts/classes/locations/customers/vendors)
+     * @returns {number}
+     */
+    function countChangedMasterDataRecords(data) {
+        if (!data) return 0;
+        const sections = [data.accounts, data.classes, data.locations, data.customers, data.vendors];
+        return sections.reduce((total, list) => {
+            return Array.isArray(list) ? total + list.filter(isChangedRecord).length : total;
+        }, 0);
     }
 
     const ExcelService = {
@@ -732,6 +977,7 @@ Office.onReady(() => {
 
             DashboardService.render();
             ViewRouter.show("Dashboard");
+            DashboardService.showStatus("Login successful.", "success");
         },
 
         /**
@@ -767,12 +1013,14 @@ Office.onReady(() => {
                     this._persistSubscription();
                     DashboardService.render();
                     ViewRouter.show("Dashboard");
+                    DashboardService.showStatus("Login successful.", "success");
                 } else {
                     // Plan is null or missing — show subscription page
                     ViewRouter.show("Plans");
                 }
             } catch {
                 ViewRouter.show("Plans");
+                DashboardService.showStatus("Login failed. Please try again.", "error");
             }
         },
 
@@ -1010,6 +1258,7 @@ Office.onReady(() => {
             if (planEl) planEl.textContent  = plan;
 
             ViewRouter.show("Success");
+            DashboardService.showStatus("Payment successful.", "success", `Subscribed to the ${plan} plan.`);
         },
 
         /**
@@ -1031,11 +1280,14 @@ Office.onReady(() => {
                     if (idEl)   idEl.textContent   = AppState.subscriptionId;
                     if (planEl) planEl.textContent  = AppState.subscriptionPlan;
                     ViewRouter.show("Success");
+                    DashboardService.showStatus("Payment successful.", "success", `Subscribed to the ${AppState.subscriptionPlan} plan.`);
                 } else {
                     ViewRouter.show("Payment");
+                    DashboardService.showStatus("Payment verification failed.", "error", "We couldn't find an active subscription yet. Please try again.");
                 }
             } catch {
                 ViewRouter.show("Payment");
+                DashboardService.showStatus("Payment verification failed.", "error", "Please try again.");
             }
         }
     };
@@ -1671,16 +1923,27 @@ Office.onReady(() => {
         },
 
         /**
-         * Displays a status notification in the dashboard status bar.
+         * Displays a status notification in the dashboard status bar, pops
+         * an immediate top-right toast, and records the same notification
+         * in the Bell Notification Center. Transient "in progress" messages
+         * (e.g. "Pulling data...") are shown in the status bar but not
+         * turned into a toast/notification — only terminal outcomes are, so
+         * the user isn't shown a toast for every intermediate step.
          * @param {string} message
          * @param {"success"|"error"} type
+         * @param {string} [detail] - optional second line shown under the toast title and in the bell drawer
          */
-        showStatus(message, type) {
+        showStatus(message, type, detail) {
             const bar = AppState.erpConnected ? document.getElementById("statusBarConnected") : document.getElementById("statusBar");
-            if (!bar) return;
-            bar.innerHTML    = message;
-            bar.className    = "status-bar";
-            bar.classList.add(type === "success" ? "status-success" : "status-error");
+            if (bar) {
+                bar.innerHTML    = message;
+                bar.className    = "status-bar";
+                bar.classList.add(type === "success" ? "status-success" : "status-error");
+            }
+
+            if (typeof message === "string" && !message.trim().endsWith("...")) {
+                NotificationService.add(message, type, detail);
+            }
         },
 
         /**
@@ -1711,6 +1974,10 @@ Office.onReady(() => {
             const msgEl = document.getElementById("errorMessage");
             if (msgEl) msgEl.textContent = message;
             ViewRouter.show("Error");
+            // Also surface as an immediate toast + bell entry, same as any
+            // other action failure — the full-screen Error view is shown
+            // too, but the user shouldn't have to rely on that alone.
+            NotificationService.add(message, "error");
         },
 
         /**
@@ -2055,6 +2322,9 @@ Office.onReady(() => {
 
         // ---- Dashboard View ----
         bindDashboardView() {
+            // Notification bell / drawer / Clear All
+            NotificationService.init();
+
             // Logouts
             const handleLogout = (e) => {
                 if (e) e.preventDefault();
@@ -2422,8 +2692,13 @@ Office.onReady(() => {
                     const data = await ApiService.fetchMasterData(AppState.currentProvider, AppState.currentCompanyId);
                     await ExcelService.writeMasterData(AppState.currentProvider, data);
                     document.getElementById("provStepPull")?.classList.add("complete");
-                    DashboardService.addLog("Master data imported successfully.");
-                    DashboardService.showStatus("Master data imported successfully.", "success");
+                    const changedCount = countChangedMasterDataRecords(data);
+                    const pullTitle = "Data pull completed successfully.";
+                    const pullDetail = changedCount > 0
+                        ? `${changedCount} new/updated record${changedCount === 1 ? "" : "s"} found.`
+                        : "Data synchronized successfully.";
+                    DashboardService.addLog(`${pullTitle} ${pullDetail}`);
+                    DashboardService.showStatus(pullTitle, "success", pullDetail);
                     DashboardService.renderERPSection();
                 } catch (error) {
                     console.error(error);
@@ -2436,7 +2711,11 @@ Office.onReady(() => {
                         ? error.message
                         : "Error pulling data: " + error.message;
                     DashboardService.addLog(msg);
-                    DashboardService.showStatus(isExpired ? "Session expired. Please reconnect." : "Error pulling data.", "error");
+                    DashboardService.showStatus(
+                        isExpired ? "Session expired. Please reconnect." : "Data pull failed.",
+                        "error",
+                        isExpired ? "" : "Please try again."
+                    );
                     if (isExpired) {
                         // renderERPConsole() only toggles a progress-step
                         // marker — it doesn't touch the company badge. To
@@ -2492,8 +2771,13 @@ Office.onReady(() => {
                     const data = await ApiService.fetchMasterData(AppState.currentProvider, AppState.currentCompanyId);
                     await ExcelService.writeMasterData(AppState.currentProvider, data);
                     DashboardService.completeStep("stepPull");
-                    DashboardService.addLog("Master data imported successfully.");
-                    DashboardService.showStatus("Master data imported successfully.", "success");
+                    const changedCount = countChangedMasterDataRecords(data);
+                    const pullTitle = "Data pull completed successfully.";
+                    const pullDetail = changedCount > 0
+                        ? `${changedCount} new/updated record${changedCount === 1 ? "" : "s"} found.`
+                        : "Data synchronized successfully.";
+                    DashboardService.addLog(`${pullTitle} ${pullDetail}`);
+                    DashboardService.showStatus(pullTitle, "success", pullDetail);
                     DashboardService.renderERPSection();
                 } catch (error) {
                     console.error(error);
@@ -2506,7 +2790,11 @@ Office.onReady(() => {
                         ? error.message
                         : "Error pulling data: " + error.message;
                     DashboardService.addLog(msg);
-                    DashboardService.showStatus(isExpired ? "Session expired. Please reconnect." : "Error pulling data.", "error");
+                    DashboardService.showStatus(
+                        isExpired ? "Session expired. Please reconnect." : "Data pull failed.",
+                        "error",
+                        isExpired ? "" : "Please try again."
+                    );
                     if (isExpired) {
                         // renderERPConsole() only toggles a progress-step
                         // marker — it doesn't touch the company badge. To
@@ -2621,12 +2909,17 @@ Office.onReady(() => {
                     const timestamp = new Date().toLocaleTimeString();
                     await ExcelService.stampLastRefreshed(timestamp);
 
+                    const changedCount = countChangedMasterDataRecords(data);
+                    const refreshTitle = "Data refresh completed successfully.";
+                    const refreshDetail = changedCount > 0
+                        ? `${changedCount} new/updated record${changedCount === 1 ? "" : "s"} found.`
+                        : "Data synchronized successfully.";
                     DashboardService.addLog("Live data refreshed and timestamp stamped successfully.");
-                    DashboardService.showStatus("Updated successfully.", "success");
+                    DashboardService.showStatus(refreshTitle, "success", refreshDetail);
                 } catch (err) {
                     console.error("Refresh error:", err);
                     DashboardService.addLog("Error refreshing: " + err.message);
-                    DashboardService.showStatus("Error refreshing: " + err.message, "error");
+                    DashboardService.showStatus("Data refresh failed.", "error", "Please try again.");
                 } finally {
                     setTimeout(() => {
                         if (icon) icon.classList.remove("spin");

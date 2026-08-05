@@ -18,9 +18,9 @@ class AuthValidation {
         const errors = [];
         const { name, email, password } = body || {};
 
-        if (!name || typeof name !== 'string' || name.trim().length < 2) {
-            errors.push('Name must be at least 2 characters');
-        }
+        // if (!name || typeof name !== 'string' || name.trim().length < 0) {
+        //     errors.push('Name required');
+        // }
 
         if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
             errors.push('A valid email address is required');

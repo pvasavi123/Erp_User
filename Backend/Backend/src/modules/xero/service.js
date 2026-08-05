@@ -74,7 +74,11 @@ class XeroService {
                 session_info: sessionInfo,
                 mail:         mail,
                 company_name: tenant.tenantName || 'Xero Organisation',
-                status:       'Active'
+                // A freshly connected organisation hasn't had a Master Data
+                // Pull yet, so it starts "Not Synced" rather than "Active" —
+                // pullMasterData flips it to 'Active' once the first pull
+                // succeeds.
+                status:       'Not Synced'
             })
         ));
 
@@ -143,7 +147,9 @@ class XeroService {
                 session_info:  sessionInfo,
                 mail,
                 company_name:  tenant.tenantName || 'Xero Organisation',
-                status:        'Active'
+                // See exchangeAndSaveToken above — new connections start
+                // 'Not Synced' until their first successful Master Data Pull.
+                status:        'Not Synced'
             })
         ));
 
@@ -378,7 +384,7 @@ class XeroService {
             platform:     'Xero',
             companyName:  t.company_name || 'Xero Organisation',
             companyId:    t.tenant_id,
-            status:       t.status || 'Active',
+            status:       t.status || 'Not Synced',
             // XeroToken doesn't rename its timestamp attributes like
             // QuickBooksToken does — the JS-side properties are the default
             // updatedAt/createdAt, not updated_at/created_at.
@@ -416,11 +422,23 @@ class XeroService {
 
     static async activateConnection(companyId) {
         const { XeroToken } = require('../../core/database');
+        const { Op } = require('sequelize');
+
+        // Selecting/switching to a connection re-activates it if it was
+        // 'Disconnected', but must not resurrect 'Not Synced' to 'Active' —
+        // that transition only happens via a successful Master Data Pull
+        // (see pullMasterData).
         const [updated] = await XeroToken.update(
             { status: 'Active' },
-            { where: { tenant_id: companyId } }
+            { where: { tenant_id: companyId, status: { [Op.ne]: 'Not Synced' } } }
         );
-        return updated > 0;
+        if (updated > 0) return true;
+
+        // If nothing matched, the row might legitimately be 'Not Synced'
+        // (or simply not exist) — confirm it exists so the caller still
+        // gets a truthy result for "this company is now the active one".
+        const existing = await XeroToken.findOne({ where: { tenant_id: companyId } });
+        return !!existing;
     }
 
     static async renameConnection(companyId, companyName) {
@@ -434,11 +452,16 @@ class XeroService {
 
     static async pullMasterData(companyId, tier) {
         const { XeroToken } = require('../../core/database');
+        const { Op } = require('sequelize');
         const maxAllowed = XeroService.getMaxConnections(tier);
 
+        // Include 'Not Synced' connections (not just 'Active') so a
+        // freshly connected organisation that has never been pulled yet
+        // is still eligible for this — and only this pull is what
+        // transitions it to 'Active' below.
         const rawTokens = companyId
             ? await XeroToken.findAll({ where: { tenant_id: companyId } })
-            : await XeroToken.findAll({ where: { status: 'Active' }, order: [['updated_at', 'DESC']] });
+            : await XeroToken.findAll({ where: { status: { [Op.ne]: 'Disconnected' } }, order: [['updated_at', 'DESC']] });
 
         const tokens = rawTokens.slice(0, maxAllowed).map(t => ({
             platform:    'xero',
@@ -522,8 +545,11 @@ class XeroService {
 
                 const tag = items => items.map(i => ({ ...i, clientId: orgName, clientName: orgName }));
 
+                // First successful pull (or any subsequent one) marks the
+                // connection 'Active' — this is what takes it out of the
+                // initial 'Not Synced' state.
                 await XeroToken.update(
-                    { last_synced_at: new Date() },
+                    { last_synced_at: new Date(), status: 'Active' },
                     { where: { tenant_id: token.companyId } }
                 );
 
