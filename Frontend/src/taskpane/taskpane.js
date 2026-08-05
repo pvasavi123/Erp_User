@@ -1763,9 +1763,15 @@ Office.onReady(() => {
 
         formatRelativeTime(dateInput, status) {
             if (status === 'Disconnected') return "Disconnected";
-            if (!dateInput) return "Not synced yet";
+            // A freshly connected company starts with status 'Not Synced'
+            // and no lastSyncedAt — show that literally instead of a vaguer
+            // "not synced yet". Once the first Master Data Pull succeeds,
+            // the backend flips status to 'Active' and stamps lastSyncedAt,
+            // so this falls through to the relative-time formatting below
+            // (which reports "Just now" immediately after that pull).
+            if (status === 'Not Synced' || !dateInput) return "Not Synced";
             const date = new Date(dateInput);
-            if (isNaN(date.getTime())) return "Not synced yet";
+            if (isNaN(date.getTime())) return "Not Synced";
             const now = new Date();
             const diffMs = now - date;
             if (diffMs < 0) return "Just now";
@@ -2712,7 +2718,7 @@ Office.onReady(() => {
                         : "Error pulling data: " + error.message;
                     DashboardService.addLog(msg);
                     DashboardService.showStatus(
-                        isExpired ? "Session expired. Please reconnect." : "Data pull failed.",
+                        isExpired ? error.message : "Data pull failed.",
                         "error",
                         isExpired ? "" : "Please try again."
                     );
@@ -2791,7 +2797,7 @@ Office.onReady(() => {
                         : "Error pulling data: " + error.message;
                     DashboardService.addLog(msg);
                     DashboardService.showStatus(
-                        isExpired ? "Session expired. Please reconnect." : "Data pull failed.",
+                        isExpired ? error.message : "Data pull failed.",
                         "error",
                         isExpired ? "" : "Please try again."
                     );

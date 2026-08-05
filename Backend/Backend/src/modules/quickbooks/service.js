@@ -421,11 +421,17 @@ class QuickBooksService {
 
     static async pullMasterData(companyId, tier) {
         const { QuickBooksToken } = require('../../core/database');
+        const { Op } = require('sequelize');
         const maxAllowed = QuickBooksService.getMaxConnections(tier);
 
+        // Exclude 'Disconnected' connections from the bulk (no companyId)
+        // pull — a revoked/expired connection stops being retried
+        // automatically the moment it's marked disconnected; it only comes
+        // back once the user reconnects. 'Not Synced' connections are still
+        // included since they've never had a chance to sync yet.
         const rawTokens = companyId
             ? await QuickBooksToken.findAll({ where: { realm_id: companyId } })
-            : await QuickBooksToken.findAll({ order: [['updated_at', 'DESC']] });
+            : await QuickBooksToken.findAll({ where: { status: { [Op.ne]: 'Disconnected' } }, order: [['updated_at', 'DESC']] });
 
         const tokens = rawTokens.slice(0, maxAllowed).map(t => ({
             platform:     'quickbooks',

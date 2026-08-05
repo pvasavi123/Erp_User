@@ -58,9 +58,21 @@ class QuickBooksTokenRepository extends IOAuthTokenRepository {
         );
     }
 
+    /**
+     * Marks the connection as needing reconnection and wipes the now-unusable
+     * credentials — access token, refresh token, and any stored provider
+     * session — rather than just flipping the status flag. `access_token`/
+     * `refresh_token` are NOT NULL columns, so they're cleared to an empty
+     * string (falsy, same practical effect as null, no schema change needed).
+     */
     async markDisconnected(realmId) {
         await QuickBooksToken.update({
-            status: 'Disconnected'
+            status: 'Disconnected',
+            access_token: '',
+            refresh_token: '',
+            expires_in: 0,
+            x_refresh_token_expires_in: 0,
+            session_info: null
         }, {
             where: { realm_id: realmId }
         });

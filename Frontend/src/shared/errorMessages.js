@@ -34,7 +34,7 @@ export const ERROR_MESSAGES = {
     [ERROR_CODES.SESSION_EXPIRED]:
         "Session expired. Please log in again.",
     [ERROR_CODES.ERP_SESSION_EXPIRED]:
-        "QuickBooks/Xero connection expired. Please reconnect your company.",
+        "Your QuickBooks/Xero session has expired. Please reconnect.",
     [ERROR_CODES.ERP_REFRESH_FAILED]:
         "Could not reach QuickBooks/Xero right now. Please try again shortly.",
     [ERROR_CODES.VALIDATION]:

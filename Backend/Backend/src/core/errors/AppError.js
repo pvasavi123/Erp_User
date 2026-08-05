@@ -71,7 +71,7 @@ class SessionExpiredError extends AppError {
 class ErpSessionExpiredError extends AppError {
     constructor(provider = 'ERP', details = 'OAuth refresh token expired.') {
         super(
-            `${provider} connection expired. Please reconnect your company.`,
+            `Your ${provider} session has expired. Please reconnect.`,
             401,
             'ERR_ERP_SESSION_EXPIRED',
             details

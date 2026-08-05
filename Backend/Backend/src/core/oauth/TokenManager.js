@@ -117,16 +117,22 @@ class TokenManager {
     }
 
     /**
-     * Determine if an error from the OAuth provider signifies token revocation.
-     * @param {Error} error 
+     * Determine if an error from the OAuth provider signifies token revocation
+     * (refresh token invalid, expired, or revoked) rather than a transient
+     * failure. On a true positive, the caller stops retrying immediately —
+     * no further refresh attempts are made for this connection.
+     * @param {Error} error
      * @returns {boolean}
      */
     isRevocationError(error) {
         if (error.response && error.response.data) {
             const data = error.response.data;
             const errStr = JSON.stringify(data).toLowerCase();
-            // Typical OAuth revoked response keywords: invalid_grant, expired_refresh_token
-            return errStr.includes('invalid_grant') || errStr.includes('invalid_token');
+            // Typical OAuth revoked response keywords/errors:
+            // invalid_grant, invalid_token, unauthorized.
+            return errStr.includes('invalid_grant')
+                || errStr.includes('invalid_token')
+                || errStr.includes('unauthorized');
         }
         return false;
     }
