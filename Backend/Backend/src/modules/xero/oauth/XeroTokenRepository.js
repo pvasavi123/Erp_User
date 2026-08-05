@@ -6,13 +6,25 @@ class XeroTokenRepository extends IOAuthTokenRepository {
         const token = await XeroToken.findOne({ where: { tenant_id: tenantId } });
         if (!token) return null;
 
-        // Calculate expires_at dynamically from updatedAt. Note: the XeroToken
-        // model uses `underscored: true` without renaming the timestamp
-        // attributes themselves (unlike QuickBooksToken, which explicitly
-        // maps createdAt/updatedAt -> created_at/updated_at). That means only
-        // the DB column is snake_case here — the JS-side instance property
-        // Sequelize exposes is still `updatedAt`, not `updated_at`.
-       const expiresAt = new Date(token.updatedAt.getTime() + 30 * 60 * 1000);
+        // Calculate expires_at dynamically from updatedAt + the *actual*
+        // expires_in Xero returned (saveToken() already persists it below).
+        // This used to be hardcoded to a flat 30 minutes regardless of what
+        // Xero really granted — if the real token lifetime differs (Xero
+        // has granted 60-minute tokens for some apps/environments), that
+        // hardcoded assumption would let TokenManager treat an already-
+        // expired access token as still valid, so a real API call would
+        // fail with a raw 401 before the revocation/reconnect flow ever
+        // kicked in. Falls back to 30 minutes only if expires_in is
+        // missing/zero (e.g. a legacy row from before this was tracked).
+        //
+        // Note: the XeroToken model uses `underscored: true` without
+        // renaming the timestamp attributes themselves (unlike
+        // QuickBooksToken, which explicitly maps createdAt/updatedAt ->
+        // created_at/updated_at). That means only the DB column is
+        // snake_case here — the JS-side instance property Sequelize
+        // exposes is still `updatedAt`, not `updated_at`.
+        const expiresInSeconds = token.expires_in > 0 ? token.expires_in : 30 * 60;
+        const expiresAt = new Date(token.updatedAt.getTime() + expiresInSeconds * 1000);
 
         return {
             accessToken: token.access_token,

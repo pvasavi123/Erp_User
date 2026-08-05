@@ -103,13 +103,31 @@ Office.onReady(() => {
     // NOTIFICATION SERVICE — Bell icon + drawer notification history
     // ============================================================
     const NotificationService = {
-        STORAGE_KEY: "fa_notifications",
+        STORAGE_KEY_PREFIX: "fa_notifications",
         MAX_ITEMS: 50,
+
+        /**
+         * Notifications are scoped per logged-in user — each user gets
+         * their own localStorage bucket, keyed off their (normalized)
+         * email, so one user's history/badge is never visible to another
+         * user on the same device. Before anyone is logged in (rare —
+         * e.g. a "popup blocked" toast during the login flow itself),
+         * everything falls into a shared "anonymous" bucket.
+         * @returns {string}
+         */
+        _currentUserKey() {
+            const email = (AppState.userEmail || "").trim().toLowerCase();
+            return email || "anonymous";
+        },
+
+        _storageKey() {
+            return `${this.STORAGE_KEY_PREFIX}_${this._currentUserKey()}`;
+        },
 
         /** @returns {Array<{id:string,type:'success'|'error',message:string,detail:string,timestamp:string,read:boolean}>} */
         _load() {
             try {
-                const raw = localStorage.getItem(this.STORAGE_KEY);
+                const raw = localStorage.getItem(this._storageKey());
                 const parsed = raw ? JSON.parse(raw) : [];
                 return Array.isArray(parsed) ? parsed : [];
             } catch (_) {
@@ -119,7 +137,7 @@ Office.onReady(() => {
 
         _save(list) {
             try {
-                localStorage.setItem(this.STORAGE_KEY, JSON.stringify(list));
+                localStorage.setItem(this._storageKey(), JSON.stringify(list));
             } catch (_) {
                 // Storage full/unavailable — notifications just won't persist
                 // across a refresh, but the app keeps working.
@@ -240,9 +258,9 @@ Office.onReady(() => {
             this.renderBadge();
         },
 
-        /** Permanently deletes every notification from storage. */
+        /** Permanently deletes every notification from storage for the current user. */
         clearAll() {
-            localStorage.removeItem(this.STORAGE_KEY);
+            localStorage.removeItem(this._storageKey());
             this.renderBadge();
             this.renderDrawer();
         },
@@ -1164,6 +1182,17 @@ Office.onReady(() => {
             AppState.erpOrgName       = null;
             AppState.erpConnectedDate = null;
             AppState.jwtToken         = null;  // Clear the JWT token on logout
+
+            // AppState.userEmail is now cleared, so this re-reads (and
+            // hides) the badge from the shared "anonymous" bucket instead
+            // of leaving the just-logged-out user's unread count on screen.
+            // Also force-close the drawer so a different user logging in
+            // next never has a chance to see it still open with the
+            // previous user's rendered notification list inside it.
+            NotificationService.renderBadge();
+            const openDrawer = document.getElementById("notifDrawer");
+            if (openDrawer) openDrawer.style.display = "none";
+
             // Note: AppState.sessionExpired is deliberately NOT reset here —
             // it's only cleared once a fresh token is obtained via a
             // successful login (see checkSubscription / handleGoogleAuth /
@@ -1306,6 +1335,13 @@ Office.onReady(() => {
             const name  = AppState.userName  || AppState.userEmail || "User";
             const first = name.split(" ")[0];
             const initial = name.charAt(0).toUpperCase();
+
+            // Notifications are scoped per user (see NotificationService),
+            // so every dashboard render — login, session restore, or a
+            // different user signing in — must re-read the badge from
+            // *this* user's storage bucket rather than leaving whatever
+            // count was last drawn for a previous user.
+            NotificationService.renderBadge();
 
             // Set avatar initials
             const avatars = ["dashHeaderAvatarBtn1", "dashHeaderAvatarBtn2", "dashHeaderAvatarBtn3", "dropdownAvatar", "blockAvatar"];

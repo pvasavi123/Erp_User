@@ -527,11 +527,45 @@ class XeroService {
                 }
                 const orgRes = orgSettled[0].value;
 
-                const [contactRes, accRes, classRes] = await Promise.all([
-                    xeroGet(CONSTANTS.XERO.CONTACTS_URL).catch(() => null),
-                    xeroGet(CONSTANTS.XERO.ACCOUNTS_URL).catch(() => null),
-                    xeroGet(CONSTANTS.XERO.TRACKING_CATEGORIES_URL).catch(() => null)
+                // Use allSettled (not a bare .catch(() => null) per call) so
+                // an auth failure on ANY of these three doesn't get silently
+                // swallowed into "no data for that section" — which used to
+                // let the pull finish "successfully" with partial/empty
+                // results instead of stopping and asking the user to
+                // reconnect. Non-auth failures (a transient blip on one
+                // endpoint) still degrade gracefully to null below.
+                const [contactSettled, accSettled, classSettled] = await Promise.allSettled([
+                    xeroGet(CONSTANTS.XERO.CONTACTS_URL),
+                    xeroGet(CONSTANTS.XERO.ACCOUNTS_URL),
+                    xeroGet(CONSTANTS.XERO.TRACKING_CATEGORIES_URL)
                 ]);
+
+                for (const settled of [contactSettled, accSettled, classSettled]) {
+                    if (settled.status !== 'rejected') continue;
+                    const reason = settled.reason;
+
+                    if (reason instanceof ErpSessionExpiredError) {
+                        throw reason;
+                    }
+                    if (isAuthError(reason)) {
+                        await XeroToken.update(
+                            { status: 'Disconnected' },
+                            { where: { tenant_id: token.companyId } }
+                        );
+                        throw new ErpSessionExpiredError(
+                            'Xero',
+                            `Xero refresh token expired/revoked for company "${token.companyName}" (${token.companyId}): ${reason?.message}`
+                        );
+                    }
+                    // Non-auth error on this one endpoint — log and continue
+                    // with a null result for it rather than failing the
+                    // whole company's pull.
+                    logger.warn(`Non-auth error fetching Xero data for company ${token.companyId}:`, reason?.message);
+                }
+
+                const contactRes = contactSettled.status === 'fulfilled' ? contactSettled.value : null;
+                const accRes     = accSettled.status === 'fulfilled' ? accSettled.value : null;
+                const classRes   = classSettled.status === 'fulfilled' ? classSettled.value : null;
 
                 const company  = orgRes ? XeroMapper.toOrganisation(orgRes.data) : null;
                 const orgName  = company?.name || token.companyName;
